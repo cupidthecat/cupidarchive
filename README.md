@@ -138,6 +138,38 @@ Link against the library:
 gcc -o myapp myapp.c -Lcupidarchive -lcupidarchive -lz -lbz2
 ```
 
+## Testing
+
+The library includes a comprehensive test suite. To run tests:
+
+```bash
+cd cupidarchive
+make test
+```
+
+This will:
+- Build the library (if not already built)
+- Compile all test executables
+- Run all tests and report results
+
+### Advanced Testing
+
+Run tests with AddressSanitizer for memory error detection:
+
+```bash
+cd cupidarchive/tests
+make test-asan
+```
+
+Run tests with Valgrind for detailed memory analysis:
+
+```bash
+cd cupidarchive/tests
+make test-valgrind
+```
+
+See `tests/README.md` for more information about the test suite.
+
 ## Safety Features
 
 - **Byte limits:** Every stream has a hard byte limit to prevent zip bombs
