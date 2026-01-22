@@ -63,9 +63,14 @@ struct TarHeader {
 #define TAR_XHDTYPE   'x'  // pax extended header
 #define TAR_XGLTYPE   'g'  // pax global header
 
+// Format types (must match arc_reader.c)
+#define ARC_FORMAT_TAR 0
+#define ARC_FORMAT_ZIP 1
+
 // TAR reader structure
 // Note: ArcReader is actually a TarReader (they're the same)
 typedef struct TarReader {
+    int format;  // ARC_FORMAT_TAR
     ArcStream *stream;
     ArcEntry current_entry;
     bool entry_valid;
@@ -411,6 +416,7 @@ ArcReader *arc_tar_open(ArcStream *stream) {
         return NULL;
     }
     
+    tar->format = ARC_FORMAT_TAR;
     tar->stream = stream;
     tar->entry_valid = false;
     tar->eof = false;

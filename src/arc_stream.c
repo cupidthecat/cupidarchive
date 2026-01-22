@@ -88,7 +88,9 @@ static int64_t fd_tell(ArcStream *stream) {
 
 static void fd_close(ArcStream *stream) {
     struct FdStreamData *data = (struct FdStreamData *)stream->user_data;
-    // Note: We don't close the fd here - caller owns it
+    if (data && data->fd >= 0) {
+        close(data->fd);
+    }
     free(data);
     free(stream);
 }

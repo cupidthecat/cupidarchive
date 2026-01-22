@@ -7,16 +7,16 @@ A lightweight, safe archive reading library for previewing and extracting archiv
 CupidArchive provides a clean 3-layer architecture for reading archive files:
 
 1. **IO Layer** - Safe stream abstraction with byte limits to prevent zip bombs
-2. **Filter Layer** - Decompression wrappers (gzip, bzip2, xz)
-3. **Format Layer** - Archive format parsers (TAR, with more to come)
+2. **Filter Layer** - Decompression wrappers (gzip, bzip2, deflate, xz)
+3. **Format Layer** - Archive format parsers (TAR, ZIP)
 
 The library is designed with safety as a primary concern: every stream has a hard byte limit to prevent zip bomb attacks, and all operations are bounds-checked.
 
 ## Current Support
 
-- **Formats:** TAR (ustar + pax extensions)
-- **Compression:** gzip (zlib), bzip2 (libbz2), xz/lzma (planned)
-- **Entry Types:** Regular files, directories, symlinks, hardlinks
+- **Formats:** TAR (ustar + pax extensions), ZIP (central directory + streaming mode, ZIP64 support)
+- **Compression:** gzip (zlib), bzip2 (libbz2), deflate (zlib, for ZIP), xz/lzma (detection only, not implemented)
+- **Entry Types:** Regular files, directories, symlinks, hardlinks (TAR only), files and directories (ZIP)
 - **Operations:** Reading, previewing, and **extraction**
 
 ## Architecture
@@ -100,6 +100,17 @@ The filter layer wraps underlying streams to provide decompression. Filters are 
 
 - Currently a placeholder (returns NULL with ENOSYS)
 - Planned for future implementation with liblzma
+- Format detection recognizes XZ magic bytes but cannot decompress
+
+#### Deflate Filter (`arc_filter_deflate`)
+
+- Uses zlib's `inflateInit2()` with `-MAX_WBITS` for raw deflate (no gzip wrapper)
+- Used internally by ZIP format for deflate-compressed entries
+- Maintains a 64KB input buffer
+- Streams decompression
+- Does NOT support seeking (returns ESPIPE)
+- Tracks decompressed bytes for `tell()` operation
+- Does NOT close underlying stream (caller owns it)
 
 ### Layer 3: Format Layer
 
@@ -150,20 +161,63 @@ typedef struct TarReader {
 - Data is padded to 512-byte block boundaries
 - Zero blocks indicate end of archive
 
+#### ZIP Format (`arc_zip.h`, `arc_zip.c`)
+
+The ZIP format implementation supports:
+
+**ZIP Features:**
+- **Central Directory parsing** - Fast listing using central directory (standard ZIP files)
+- **Streaming mode** - Falls back to local header parsing when central directory is missing
+- **ZIP64 support** - Files >4GB, archives >4GB, >65535 entries
+- **Compression methods:** Store (0) and Deflate (8)
+- **Directory detection** - Detected by filename ending with `/`
+- **Encryption detection** - Flags encrypted entries (extraction not supported)
+
+**ZIP64 Features:**
+- Automatically detects ZIP64 archives via EOCD64 locator
+- Parses ZIP64 Extended Information Extra Field (0x0001)
+- Uses 64-bit sizes and offsets when standard fields are 0xFFFFFFFF
+
+**ZIP Reader State:**
+```c
+typedef struct ZipReader {
+    ArcStream *stream;              // Underlying stream
+    ArcEntry current_entry;         // Current entry data
+    bool entry_valid;               // Whether entry data is available
+    int64_t entry_data_offset;      // Stream offset of entry data
+    int64_t entry_data_remaining;   // Bytes remaining in entry
+    bool eof;                        // End of archive reached
+    bool streaming_mode;            // Using streaming (local header) mode
+    // ... internal state for central directory or streaming
+} ZipReader;
+```
+
+**Key Implementation Details:**
+- Entry data is NOT read automatically - must call `arc_open_data()` or `arc_skip_data()`
+- Entry remains valid until next `arc_next()` call or explicit `arc_skip_data()`
+- Central directory mode: reads all entries from central directory first
+- Streaming mode: reads entries sequentially from local file headers
+- Supports both compressed (deflate) and uncompressed (store) entries
+
 #### Archive Reader (`arc_reader.h`, `arc_reader.c`)
 
 The unified reader API provides format-agnostic access to archives.
 
 **Format Detection:**
 1. Reads first 4 bytes to detect compression
-2. Wraps stream with appropriate decompression filter if needed
-3. Reads first 512 bytes to detect archive format
-4. Checks for ustar magic or old TAR format indicators
+2. Wraps stream with appropriate decompression filter if needed (gzip, bzip2)
+3. Checks for ZIP format first (magic bytes `'P' 'K'`)
+4. If not ZIP, reads first 512 bytes to check for TAR format
+5. Checks for ustar magic or old TAR format indicators
 
 **Compression Detection:**
 - **Gzip:** Magic bytes `0x1f 0x8b`
 - **Bzip2:** Magic bytes `'B' 'Z' 'h'`
-- **XZ:** Magic bytes `0xFD 0x37 0x7A 0x58`
+- **XZ:** Magic bytes `0xFD 0x37 0x7A 0x58` (detected but not supported - returns error)
+
+**Format Types:**
+- `ARC_FORMAT_TAR` (0) - TAR format
+- `ARC_FORMAT_ZIP` (1) - ZIP format
 
 **Reader Lifecycle:**
 1. `arc_open_path()` or `arc_open_stream()` - Opens archive
@@ -192,7 +246,7 @@ The extraction layer provides full archive extraction capabilities.
 - Extracts a single entry
 - Must be called immediately after `arc_next()` while entry data is available
 - Creates parent directories automatically
-- Handles files, directories, symlinks, and hardlinks
+- Handles files, directories, symlinks (TAR only), and hardlinks (TAR only)
 
 #### Extraction Implementation Details
 
@@ -207,14 +261,16 @@ The extraction layer provides full archive extraction capabilities.
 - Preserves permissions if requested
 - Sets timestamps using `utime()` if requested
 
-**Symlink Extraction:**
+**Symlink Extraction (TAR only):**
 - Removes existing file/symlink first (`unlink()`)
 - Creates symlink with `symlink()`
 - Does NOT preserve permissions (symlinks don't have separate permissions)
+- ZIP format does not support symlinks
 
-**Hardlink Extraction:**
+**Hardlink Extraction (TAR only):**
 - Currently extracts as regular file (hardlink creation requires inode tracking)
 - Future enhancement: track inode mappings and create links in second pass
+- ZIP format does not support hardlinks
 
 **Attribute Preservation:**
 - Permissions: `chmod()` with `mode & 0777` (only user/group/other bits)
@@ -381,8 +437,8 @@ The library expects:
 - **Directory creation:** Automatically creates parent directories as needed (`mkdir_p()`)
 - **Permission preservation:** Optional preservation of file permissions and ownership
 - **Timestamp preservation:** Optional preservation of modification times
-- **Symlink support:** Creates symlinks correctly
-- **Hardlink handling:** Attempts to create hardlinks, falls back to copying (future: proper inode tracking)
+- **Symlink support:** Creates symlinks correctly (TAR format only)
+- **Hardlink handling:** Attempts to create hardlinks, falls back to copying (TAR format only, future: proper inode tracking)
 
 ## Testing
 
@@ -450,12 +506,13 @@ Paths are normalized to:
 
 ### Format Detection Logic
 
-1. Read first 4 bytes
-2. Check compression magic bytes
-3. If compressed, wrap with filter and read again
-4. Read first 512 bytes (TAR header)
-5. Check for ustar magic or old TAR indicators
-6. Reset stream position and return format code
+1. Read first 4 bytes to detect compression
+2. Check compression magic bytes (gzip, bzip2, xz)
+3. If compressed (gzip/bzip2), wrap with filter and read again
+4. Check for ZIP format first (magic bytes `'P' 'K'` with ZIP signatures)
+5. If not ZIP, read first 512 bytes to check for TAR format
+6. Check for ustar magic or old TAR indicators
+7. Reset stream position and return format code
 
 ### Entry Data Management
 
@@ -469,7 +526,6 @@ Paths are normalized to:
 
 - [ ] xz/lzma compression support (liblzma integration)
 - [ ] zstd compression support
-- [ ] ZIP format support
 - [ ] 7z format support
 - [ ] RAR format support (read-only)
 - [ ] Progress callbacks for extraction
@@ -477,6 +533,7 @@ Paths are normalized to:
 - [ ] Proper hardlink handling (inode tracking)
 - [ ] Ownership preservation (chown support)
 - [ ] Archive creation (write support)
+- [ ] ZIP encryption support (password-protected archives)
 
 ## License
 

@@ -11,8 +11,8 @@ OBJDIR = obj
 LIBDIR = .
 
 # Source files
-SOURCES = $(SRCDIR)/arc_stream.c $(SRCDIR)/arc_filter.c $(SRCDIR)/arc_tar.c $(SRCDIR)/arc_reader.c $(SRCDIR)/arc_extract.c
-OBJECTS = $(OBJDIR)/arc_stream.o $(OBJDIR)/arc_filter.o $(OBJDIR)/arc_tar.o $(OBJDIR)/arc_reader.o $(OBJDIR)/arc_extract.o
+SOURCES = $(SRCDIR)/arc_stream.c $(SRCDIR)/arc_filter.c $(SRCDIR)/arc_tar.c $(SRCDIR)/arc_zip.c $(SRCDIR)/arc_reader.c $(SRCDIR)/arc_extract.c
+OBJECTS = $(OBJDIR)/arc_stream.o $(OBJDIR)/arc_filter.o $(OBJDIR)/arc_tar.o $(OBJDIR)/arc_zip.o $(OBJDIR)/arc_reader.o $(OBJDIR)/arc_extract.o
 
 # Library
 LIBRARY = libcupidarchive.a
@@ -41,13 +41,18 @@ test-extract: $(LIBRARY) tests/test_extract.c
 	$(CC) $(CFLAGS) -I. -o test-extract tests/test_extract.c -L. -lcupidarchive -lz -lbz2
 	@echo "Built test-extract"
 
+# Test target
+test:
+	$(MAKE) -C tests test
+
 # Clean
 clean:
 	rm -rf $(OBJDIR) $(LIBRARY) test-extract
+	$(MAKE) -C tests clean
 
 # Install (optional)
 install: $(LIBRARY)
 	@echo "To install, copy $(LIBRARY) and headers to your system library path"
 
-.PHONY: all clean install test-extract
+.PHONY: all clean install test-extract test
 

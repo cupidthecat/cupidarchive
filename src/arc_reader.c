@@ -1,5 +1,6 @@
 #include "arc_reader.h"
 #include "arc_tar.h"
+#include "arc_zip.h"
 #include "arc_filter.h"
 #include <stdlib.h>
 #include <string.h>
@@ -12,11 +13,24 @@
 static int detect_format(ArcStream *stream, ArcStream **decompressed);
 static ArcReader *create_reader(ArcStream *stream, int format);
 
+// Format types (must match arc_tar.c and arc_zip.c)
+#define ARC_FORMAT_TAR 0
+#define ARC_FORMAT_ZIP 1
+
 int arc_next(ArcReader *reader, ArcEntry *entry) {
     if (!reader || !entry) {
         return -1;
     }
-    return arc_tar_next(reader, entry);
+    // Check format field (first field in both TarReader and ZipReader)
+    int format = ((int *)reader)[0];
+    switch (format) {
+        case ARC_FORMAT_TAR:
+            return arc_tar_next(reader, entry);
+        case ARC_FORMAT_ZIP:
+            return arc_zip_next(reader, entry);
+        default:
+            return -1;
+    }
 }
 
 void arc_entry_free(ArcEntry *entry) {
@@ -31,19 +45,48 @@ ArcStream *arc_open_data(ArcReader *reader) {
     if (!reader) {
         return NULL;
     }
-    return arc_tar_open_data(reader);
+    int format = ((int *)reader)[0];
+    switch (format) {
+        case ARC_FORMAT_TAR:
+            return arc_tar_open_data(reader);
+        case ARC_FORMAT_ZIP:
+            return arc_zip_open_data(reader);
+        default:
+            return NULL;
+    }
 }
 
 int arc_skip_data(ArcReader *reader) {
     if (!reader) {
         return -1;
     }
-    return arc_tar_skip_data(reader);
+    int format = ((int *)reader)[0];
+    switch (format) {
+        case ARC_FORMAT_TAR:
+            return arc_tar_skip_data(reader);
+        case ARC_FORMAT_ZIP:
+            return arc_zip_skip_data(reader);
+        default:
+            return -1;
+    }
 }
 
 void arc_close(ArcReader *reader) {
     if (reader) {
-        arc_tar_close(reader);
+        int format = ((int *)reader)[0];
+        switch (format) {
+            case ARC_FORMAT_TAR:
+                arc_tar_close(reader);
+                break;
+            case ARC_FORMAT_ZIP:
+                arc_zip_close(reader);
+                break;
+            default:
+                // Unknown format, try both (one will fail gracefully)
+                arc_tar_close(reader);
+                arc_zip_close(reader);
+                break;
+        }
     }
 }
 
@@ -76,7 +119,6 @@ ArcReader *arc_open_path(const char *path) {
     int format = detect_format(stream, &decompressed);
     if (format < 0) {
         arc_stream_close(stream);
-        close(fd);
         return NULL;
     }
     
@@ -90,7 +132,6 @@ ArcReader *arc_open_path(const char *path) {
             arc_stream_close(decompressed);
         }
         arc_stream_close(stream);
-        close(fd);
         return NULL;
     }
     
@@ -169,7 +210,21 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed) {
         arc_stream_seek(stream, pos, SEEK_SET);
     }
     
-    // Now detect format
+    // Now detect format (after decompression if any)
+    // Check for ZIP first (more specific signature)
+    if (n >= 2 && magic[0] == 'P' && magic[1] == 'K') {
+        // Could be ZIP - check for ZIP signatures
+        if (n >= 4) {
+            uint32_t sig = (uint32_t)magic[0] | ((uint32_t)magic[1] << 8) |
+                          ((uint32_t)magic[2] << 16) | ((uint32_t)magic[3] << 24);
+            if (sig == 0x04034b50 || sig == 0x06054b50 || sig == 0x02014b50) {
+                // ZIP signature found
+                arc_stream_seek(stream, pos, SEEK_SET);
+                return 1; // ZIP format
+            }
+        }
+    }
+    
     // TAR: Check for ustar magic or old TAR format
     // Read first 512 bytes to check TAR header
     uint8_t header[512];
@@ -193,6 +248,8 @@ static ArcReader *create_reader(ArcStream *stream, int format) {
     switch (format) {
         case 0: // TAR
             return arc_tar_open(stream);
+        case 1: // ZIP
+            return arc_zip_open(stream);
         default:
             return NULL;
     }
