@@ -357,7 +357,16 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
                           ((uint32_t)magic[2] << 16) | ((uint32_t)magic[3] << 24);
             if (sig == 0x04034b50 || sig == 0x06054b50 || sig == 0x02014b50) {
                 // ZIP signature found
-                arc_stream_seek(stream, pos, SEEK_SET);
+                if (detected_compression >= 0) {
+                    // We detected compression; report it so caller can recreate a fresh filter.
+                    *compression_type = detected_compression;
+                    // Close sniffing filter and rewind original stream.
+                    arc_stream_close(*decompressed);
+                    *decompressed = NULL;
+                    arc_stream_seek(original_stream, 0, SEEK_SET);
+                } else {
+                    arc_stream_seek(stream, pos, SEEK_SET);
+                }
                 return ARC_FORMAT_ZIP;
             }
         }
@@ -383,6 +392,8 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
                 // We'll create a fresh filter for the reader starting from position 0
                 // For regular streams, reset to beginning
                 if (detected_compression >= 0) {
+                    // We detected compression; report it so caller can recreate a fresh filter.
+                    *compression_type = detected_compression;
                     // Filter stream - can't seek, but we'll recreate it fresh
                     // Close the detection filter since we'll create a new one
                     // The underlying stream position may have advanced during detection,
