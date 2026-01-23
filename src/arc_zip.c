@@ -12,6 +12,14 @@
 #include <unistd.h>
 #include <time.h>
 #include <zlib.h>
+#include <stdint.h>
+#include <limits.h>
+
+// Security limits to prevent OOM attacks
+#define ZIP_MAX_ENTRIES 1000000UL          // Maximum number of entries
+#define ZIP_MAX_FILENAME_LENGTH 4096       // Maximum filename length
+#define ZIP_MAX_EXTRA_FIELD_LENGTH (64 * 1024)  // 64 KiB max extra field
+#define ZIP_MAX_COMMENT_LENGTH (64 * 1024)     // 64 KiB max comment
 
 // ZIP constants
 #define ZIP_LOCAL_FILE_HEADER_SIG   0x04034b50  // "PK\03\04"
@@ -322,6 +330,12 @@ static int find_eocd(ArcStream *stream, struct ZipEOCD *eocd, struct Zip64EOCDRe
             eocd->central_dir_offset = read_le32(p + 16);
             eocd->comment_length = read_le16(p + 20);
             
+            // Security: Validate comment length
+            if (eocd->comment_length > ZIP_MAX_COMMENT_LENGTH) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+            
             // Read comment if present
             if (eocd->comment_length > 0 && i + 22 + eocd->comment_length <= n) {
                 eocd->comment = malloc(eocd->comment_length + 1);
@@ -404,6 +418,20 @@ static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *
     entry->external_attrs = read_le32(header + 38);
     entry->local_header_offset = read_le32(header + 42);
     
+    // Security: Validate field lengths to prevent excessive allocations
+    if (entry->filename_length > ZIP_MAX_FILENAME_LENGTH) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (entry->extra_field_length > ZIP_MAX_EXTRA_FIELD_LENGTH) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (entry->comment_length > ZIP_MAX_COMMENT_LENGTH) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    
     // Initialize ZIP64 fields
     entry->has_zip64_fields = false;
     entry->zip64_compressed_size = 0;
@@ -473,7 +501,37 @@ static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *
 
 // Helper: Read all central directory entries
 static int read_central_directory(ArcStream *stream, int64_t offset, uint64_t count,
+                                  int64_t stream_size, uint64_t central_dir_size,
                                   struct ZipCentralDirEntry **entries_out, size_t *count_out) {
+    // Security: Check entry count limit
+    if (count > ZIP_MAX_ENTRIES) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    
+    // Security: Check for overflow in allocation size
+    if (count > SIZE_MAX / sizeof(struct ZipCentralDirEntry)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    
+    // Security: Validate central directory bounds against file size
+    if (stream_size >= 0) {
+        // Check that offset is valid
+        if (offset < 0 || (uint64_t)offset > (uint64_t)stream_size) {
+            errno = EINVAL;
+            return -1;
+        }
+        
+        // Check that central directory fits within file bounds
+        // Use actual central_dir_size if available, otherwise estimate minimum
+        uint64_t cd_size = (central_dir_size > 0) ? central_dir_size : (count * 46);
+        if (cd_size > (uint64_t)(stream_size - offset)) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    
     if (arc_stream_seek(stream, offset, SEEK_SET) < 0) {
         return -1;
     }
@@ -583,6 +641,16 @@ static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, st
     uint32_t uncompressed_size = read_le32(header + 22);
     uint16_t filename_length = read_le16(header + 26);
     uint16_t extra_field_length = read_le16(header + 28);
+    
+    // Security: Validate field lengths to prevent excessive allocations
+    if (filename_length > ZIP_MAX_FILENAME_LENGTH) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (extra_field_length > ZIP_MAX_EXTRA_FIELD_LENGTH) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     
     // Initialize entry
     memset(entry, 0, sizeof(*entry));
@@ -1010,11 +1078,20 @@ ArcReader *arc_zip_open(ArcStream *stream) {
         // Use ZIP64 values if available
         int64_t cd_offset = eocd.is_zip64 ? (int64_t)eocd64.central_dir_offset : (int64_t)eocd.central_dir_offset;
         uint64_t cd_count = eocd.is_zip64 ? eocd64.total_central_dir_records : (uint64_t)eocd.total_central_dir_records;
+        uint64_t cd_size = eocd.is_zip64 ? eocd64.central_dir_size : (uint64_t)eocd.central_dir_size;
+        
+        // Get stream size for bounds validation
+        int64_t stream_size = -1;
+        int64_t current_pos = arc_stream_tell(stream);
+        if (arc_stream_seek(stream, 0, SEEK_END) == 0) {
+            stream_size = arc_stream_tell(stream);
+            arc_stream_seek(stream, current_pos, SEEK_SET);
+        }
         
         zip->central_dir_offset = cd_offset;
         
-        // Read central directory
-        if (read_central_directory(stream, cd_offset, cd_count,
+        // Read central directory (with security checks)
+        if (read_central_directory(stream, cd_offset, cd_count, stream_size, cd_size,
                                    &zip->entries, &zip->entry_count) < 0) {
             free(eocd.comment);
             free(zip);
