@@ -19,6 +19,45 @@
 static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compression_type, const char *path);
 static ArcReader *create_reader(ArcStream *stream, int format, const char *path, int compression_type, ArcStream *original_stream);
 
+// TAR detection helpers
+static bool is_tar_zero_block(const uint8_t *block) {
+    for (size_t i = 0; i < 512; i++) {
+        if (block[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t parse_tar_octal(const char *str, size_t len) {
+    uint64_t val = 0;
+    for (size_t i = 0; i < len && str[i] != '\0' && str[i] != ' '; i++) {
+        if (str[i] >= '0' && str[i] <= '7') {
+            val = val * 8 + (str[i] - '0');
+        }
+    }
+    return val;
+}
+
+static bool verify_tar_checksum(const uint8_t *header) {
+    // TAR checksum is at offset 148-155 (8 bytes)
+    const size_t chksum_offset = 148;
+    const size_t chksum_size = 8;
+    
+    uint32_t sum = 0;
+    // Calculate sum treating chksum field as spaces
+    for (size_t i = 0; i < 512; i++) {
+        if (i >= chksum_offset && i < chksum_offset + chksum_size) {
+            sum += ' ';
+        } else {
+            sum += header[i];
+        }
+    }
+    
+    uint32_t stored = (uint32_t)parse_tar_octal((const char *)header + chksum_offset, chksum_size);
+    return sum == stored;
+}
+
 
 // Format types (must match arc_tar.c, arc_zip.c, and arc_compressed.c)
 #define ARC_FORMAT_TAR 0
@@ -284,33 +323,40 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         }
     }
     
-    // TAR: Check for ustar magic or old TAR format
+    // TAR: Check for ustar magic or valid TAR checksum
     // Read first 512 bytes to check TAR header
     uint8_t header[512];
     pos = arc_stream_tell(stream);
     n = arc_stream_read(stream, header, sizeof(header));
     if (n == sizeof(header)) {
-        // Check for ustar magic (at offset 257)
-        if ((memcmp(header + 257, "ustar", 5) == 0) ||
-            (memcmp(header + 257, "USTAR", 5) == 0) ||
-            (header[0] != '\0' && isprint((unsigned char)header[0]))) {
-            // For filter streams, we can't seek back, but that's OK
-            // We'll create a fresh filter for the reader starting from position 0
-            // For regular streams, reset to beginning
-            if (detected_compression >= 0) {
-                // Filter stream - can't seek, but we'll recreate it fresh
-                // Close the detection filter since we'll create a new one
-                // The underlying stream position may have advanced during detection,
-                // so we need to reset it to 0 before creating the new filter
-                arc_stream_close(*decompressed);
-                *decompressed = NULL;
-                // Reset original underlying stream to beginning
-                arc_stream_seek(original_stream, 0, SEEK_SET);
-            } else {
-                // Regular stream - reset to beginning
-                arc_stream_seek(stream, 0, SEEK_SET);
+        // Reject all-zero blocks (end of archive marker, not a valid header)
+        if (is_tar_zero_block(header)) {
+            // Not a TAR file
+        } else {
+            // Check for ustar magic (at offset 257) OR valid TAR checksum
+            bool has_ustar_magic = (memcmp(header + 257, "ustar", 5) == 0) ||
+                                    (memcmp(header + 257, "USTAR", 5) == 0);
+            bool has_valid_checksum = verify_tar_checksum(header);
+            
+            if (has_ustar_magic || has_valid_checksum) {
+                // For filter streams, we can't seek back, but that's OK
+                // We'll create a fresh filter for the reader starting from position 0
+                // For regular streams, reset to beginning
+                if (detected_compression >= 0) {
+                    // Filter stream - can't seek, but we'll recreate it fresh
+                    // Close the detection filter since we'll create a new one
+                    // The underlying stream position may have advanced during detection,
+                    // so we need to reset it to 0 before creating the new filter
+                    arc_stream_close(*decompressed);
+                    *decompressed = NULL;
+                    // Reset original underlying stream to beginning
+                    arc_stream_seek(original_stream, 0, SEEK_SET);
+                } else {
+                    // Regular stream - reset to beginning
+                    arc_stream_seek(stream, 0, SEEK_SET);
+                }
+                return ARC_FORMAT_TAR;
             }
-            return ARC_FORMAT_TAR;
         }
     }
     

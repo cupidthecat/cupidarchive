@@ -778,7 +778,7 @@ static int zip_read_entry_streaming(ZipReader *reader) {
                                (int64_t)entry.compressed_size;
     
     // Skip entry data to get to next header
-    int64_t data_start = arc_stream_tell(reader->stream);
+    int64_t data_start = arc_stream_tell(reader->base.stream);
     int64_t next_header_pos = data_start + compressed_size;
     
     // Update stream position for next read
