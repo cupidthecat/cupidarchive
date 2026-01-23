@@ -80,13 +80,35 @@ static ssize_t gzip_read(ArcStream *stream, void *buf, size_t n) {
             }
             if (in_read == 0) {
                 // No more input, finish decompression
-                int ret = inflate(&data->zs, Z_FINISH);
-                if (ret == Z_STREAM_END) {
-                    data->eof = true;
-                    break;
-                }
-                if (ret != Z_OK && ret != Z_BUF_ERROR) {
-                    return -1;
+                // Loop until we get Z_STREAM_END or an error
+                size_t output_before = n - data->zs.avail_out;
+                for (;;) {
+                    int ret = inflate(&data->zs, Z_FINISH);
+                    if (ret == Z_STREAM_END) {
+                        data->eof = true;
+                        break;
+                    }
+                    if (ret == Z_BUF_ERROR) {
+                        // Z_BUF_ERROR means no progress possible
+                        // Check if we made any progress since input was exhausted
+                        size_t output_after = n - data->zs.avail_out;
+                        if (output_after == output_before) {
+                            // No progress made, input exhausted, not at stream end
+                            // This indicates a truncated stream
+                            errno = EINVAL;
+                            return -1;
+                        }
+                        // Made progress, continue trying
+                        output_before = output_after;
+                        continue;
+                    }
+                    if (ret != Z_OK) {
+                        // Other error (Z_DATA_ERROR, Z_MEM_ERROR, etc.)
+                        return -1;
+                    }
+                    // Z_OK means we made progress, continue
+                    size_t output_after = n - data->zs.avail_out;
+                    output_before = output_after;
                 }
                 break;
             }
@@ -94,12 +116,25 @@ static ssize_t gzip_read(ArcStream *stream, void *buf, size_t n) {
             data->zs.avail_in = (uInt)in_read;
         }
         
+        size_t output_before = n - data->zs.avail_out;
         int ret = inflate(&data->zs, Z_NO_FLUSH);
         if (ret == Z_STREAM_END) {
             data->eof = true;
             break;
         }
-        if (ret != Z_OK && ret != Z_BUF_ERROR) {
+        if (ret == Z_BUF_ERROR) {
+            // Z_BUF_ERROR: check if we made progress
+            size_t output_after = n - data->zs.avail_out;
+            if (output_after == output_before && data->zs.avail_in == 0) {
+                // No progress and no input available - try reading more
+                // (will be handled in next iteration)
+                continue;
+            }
+            // Made progress or have input, continue
+            continue;
+        }
+        if (ret != Z_OK) {
+            // Other error
             return -1;
         }
     }
@@ -375,13 +410,35 @@ static ssize_t deflate_read(ArcStream *stream, void *buf, size_t n) {
             }
             if (in_read == 0) {
                 // No more input, finish decompression
-                int ret = inflate(&data->zs, Z_FINISH);
-                if (ret == Z_STREAM_END) {
-                    data->eof = true;
-                    break;
-                }
-                if (ret != Z_OK && ret != Z_BUF_ERROR) {
-                    return -1;
+                // Loop until we get Z_STREAM_END or an error
+                size_t output_before = n - data->zs.avail_out;
+                for (;;) {
+                    int ret = inflate(&data->zs, Z_FINISH);
+                    if (ret == Z_STREAM_END) {
+                        data->eof = true;
+                        break;
+                    }
+                    if (ret == Z_BUF_ERROR) {
+                        // Z_BUF_ERROR means no progress possible
+                        // Check if we made any progress since input was exhausted
+                        size_t output_after = n - data->zs.avail_out;
+                        if (output_after == output_before) {
+                            // No progress made, input exhausted, not at stream end
+                            // This indicates a truncated stream
+                            errno = EINVAL;
+                            return -1;
+                        }
+                        // Made progress, continue trying
+                        output_before = output_after;
+                        continue;
+                    }
+                    if (ret != Z_OK) {
+                        // Other error (Z_DATA_ERROR, Z_MEM_ERROR, etc.)
+                        return -1;
+                    }
+                    // Z_OK means we made progress, continue
+                    size_t output_after = n - data->zs.avail_out;
+                    output_before = output_after;
                 }
                 break;
             }
@@ -389,12 +446,25 @@ static ssize_t deflate_read(ArcStream *stream, void *buf, size_t n) {
             data->zs.avail_in = (uInt)in_read;
         }
         
+        size_t output_before = n - data->zs.avail_out;
         int ret = inflate(&data->zs, Z_NO_FLUSH);
         if (ret == Z_STREAM_END) {
             data->eof = true;
             break;
         }
-        if (ret != Z_OK && ret != Z_BUF_ERROR) {
+        if (ret == Z_BUF_ERROR) {
+            // Z_BUF_ERROR: check if we made progress
+            size_t output_after = n - data->zs.avail_out;
+            if (output_after == output_before && data->zs.avail_in == 0) {
+                // No progress and no input available - try reading more
+                // (will be handled in next iteration)
+                continue;
+            }
+            // Made progress or have input, continue
+            continue;
+        }
+        if (ret != Z_OK) {
+            // Other error
             return -1;
         }
     }

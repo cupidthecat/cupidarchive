@@ -18,8 +18,8 @@
 // Security limits to prevent OOM attacks
 #define ZIP_MAX_ENTRIES 1000000UL          // Maximum number of entries
 #define ZIP_MAX_FILENAME_LENGTH 4096       // Maximum filename length
-#define ZIP_MAX_EXTRA_FIELD_LENGTH (64 * 1024)  // 64 KiB max extra field
-#define ZIP_MAX_COMMENT_LENGTH (64 * 1024)     // 64 KiB max comment
+#define ZIP_MAX_EXTRA_FIELD_LENGTH 65534   // Max extra field (uint16_t max is 65535)
+#define ZIP_MAX_COMMENT_LENGTH 65534       // Max comment (uint16_t max is 65535)
 
 // ZIP constants
 #define ZIP_LOCAL_FILE_HEADER_SIG   0x04034b50  // "PK\03\04"
@@ -611,7 +611,8 @@ static bool is_directory_name(const char *name) {
 // Helper: Read data descriptor (when bit 3 is set)
 // Data descriptor format: [optional 4-byte signature 0x08074b50] + CRC32 (4) + compressed_size (4) + uncompressed_size (4)
 // Returns 0 on success, -1 on error
-static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out) {
+// Note: Currently unused but available for future full streaming mode support
+__attribute__((unused)) static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out) {
     uint8_t buf[16];
     ssize_t n = arc_stream_read(stream, buf, 4);
     if (n != 4) {
@@ -1049,7 +1050,6 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
         return NULL;
     }
     
-    uint16_t flags = read_le16(header + 6);
     uint16_t filename_length = read_le16(header + 26);
     uint16_t extra_field_length = read_le16(header + 28);
     
