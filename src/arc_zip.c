@@ -608,10 +608,56 @@ static bool is_directory_name(const char *name) {
     return (len > 0 && name[len - 1] == '/');
 }
 
+// Helper: Read data descriptor (when bit 3 is set)
+// Data descriptor format: [optional 4-byte signature 0x08074b50] + CRC32 (4) + compressed_size (4) + uncompressed_size (4)
+// Returns 0 on success, -1 on error
+static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out) {
+    uint8_t buf[16];
+    ssize_t n = arc_stream_read(stream, buf, 4);
+    if (n != 4) {
+        return -1;
+    }
+    
+    uint32_t first_word = read_le32(buf);
+    int offset = 0;
+    
+    // Check for optional signature (0x08074b50)
+    if (first_word == 0x08074b50) {
+        // Signature present, read the rest
+        n = arc_stream_read(stream, buf, 12);
+        if (n != 12) {
+            return -1;
+        }
+        offset = 0;
+    } else {
+        // No signature, first 4 bytes are CRC32, read remaining 8 bytes
+        n = arc_stream_read(stream, buf + 4, 8);
+        if (n != 8) {
+            return -1;
+        }
+        offset = -4; // We already read CRC32 in first_word
+    }
+    
+    if (offset == 0) {
+        // Signature was present, read CRC32 from buf[0-3]
+        *crc32_out = read_le32(buf);
+        *compressed_size_out = read_le32(buf + 4);
+        *uncompressed_size_out = read_le32(buf + 8);
+    } else {
+        // No signature, first_word is CRC32
+        *crc32_out = first_word;
+        *compressed_size_out = read_le32(buf);
+        *uncompressed_size_out = read_le32(buf + 4);
+    }
+    
+    return 0;
+}
+
 // Forward declarations
 static int zip_read_entry_streaming(ZipReader *reader);
 static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry);
 static int add_stream_entry(ZipReader *zip, const struct ZipCentralDirEntry *entry);
+static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out);
 
 // Helper: Read local file header (for streaming mode)
 static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry) {
@@ -661,8 +707,17 @@ static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, st
     entry->mod_time = mod_time;
     entry->mod_date = mod_date;
     entry->crc32 = crc32;
-    entry->compressed_size = compressed_size;
-    entry->uncompressed_size = uncompressed_size;
+    
+    // When bit 3 (data descriptor) is set, sizes in local header are unreliable (usually zero)
+    // They will appear in the data descriptor after the compressed data
+    if (flags & ZIP_FLAG_DATA_DESCRIPTOR) {
+        // Mark sizes as unreliable - will be read from data descriptor later
+        entry->compressed_size = 0;
+        entry->uncompressed_size = 0;
+    } else {
+        entry->compressed_size = compressed_size;
+        entry->uncompressed_size = uncompressed_size;
+    }
     entry->filename_length = filename_length;
     entry->extra_field_length = extra_field_length;
     entry->local_header_offset = (uint32_t)header_pos;
@@ -841,16 +896,46 @@ static int zip_read_entry_streaming(ZipReader *reader) {
     }
     
     // Get data size (use ZIP64 if available)
-    int64_t compressed_size = entry.has_zip64_fields ? 
-                               (int64_t)entry.zip64_compressed_size : 
-                               (int64_t)entry.compressed_size;
-    
-    // Skip entry data to get to next header
+    int64_t compressed_size = 0;
     int64_t data_start = arc_stream_tell(reader->base.stream);
-    int64_t next_header_pos = data_start + compressed_size;
+    int64_t next_header_pos = -1;
     
-    // Update stream position for next read
-    reader->stream_pos = next_header_pos;
+    if (entry.flags & ZIP_FLAG_DATA_DESCRIPTOR) {
+        // Bit 3 is set: sizes are in data descriptor after compressed data
+        // Local header sizes are unreliable (usually zero)
+        // We need to read through the compressed data to find the descriptor
+        //
+        // Note: For streaming mode (no central directory), handling data descriptors
+        // requires decompressing the entire entry to find the descriptor, which is
+        // complex. We require central directory for entries with bit 3 set.
+        // Most ZIPs (including streaming-created ones) have central directories.
+        
+        if (entry.compression_method == ZIP_METHOD_DEFLATE) {
+            // For deflate, we would need to decompress until end, then read descriptor
+            // This requires creating a deflate filter and reading until EOF
+            // Then read the 12-16 byte data descriptor
+            // For now, require central directory (which has correct sizes)
+            errno = EINVAL;
+            return -1; // Can't handle data descriptor in streaming mode without CD
+        } else if (entry.compression_method == ZIP_METHOD_STORE) {
+            // For store, we can't determine size without descriptor
+            // We'd need to read until we find the next local header or EOCD
+            // This is impractical - require central directory
+            errno = EINVAL;
+            return -1;
+        } else {
+            // Unknown compression method with data descriptor
+            errno = EINVAL;
+            return -1;
+        }
+    } else {
+        // Normal case: use sizes from local header
+        compressed_size = entry.has_zip64_fields ? 
+                           (int64_t)entry.zip64_compressed_size : 
+                           (int64_t)entry.compressed_size;
+        next_header_pos = data_start + compressed_size;
+        reader->stream_pos = next_header_pos;
+    }
     
     // Add to entries list
     if (add_stream_entry(reader, &entry) < 0) {
@@ -964,6 +1049,7 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
         return NULL;
     }
     
+    uint16_t flags = read_le16(header + 6);
     uint16_t filename_length = read_le16(header + 26);
     uint16_t extra_field_length = read_le16(header + 28);
     
@@ -976,7 +1062,9 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
     // Get current position (start of file data)
     int64_t data_start = arc_stream_tell(zip->base.stream);
     
-    // Create substream for entry data
+    // When bit 3 (data descriptor) is set, local header sizes are unreliable
+    // Use central directory sizes (which we already have in entry_data_remaining)
+    // The substream will use the correct size from central directory
     ArcStream *data_stream = arc_stream_substream(zip->base.stream, data_start, zip->entry_data_remaining);
     if (!data_stream) {
         return NULL;
