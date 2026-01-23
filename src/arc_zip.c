@@ -626,17 +626,16 @@ static uint32_t zip_entry_mode(const struct ZipCentralDirEntry *cd_entry) {
 // Helper: Read data descriptor (when bit 3 is set)
 // Data descriptor format: [optional 4-byte signature 0x08074b50] + CRC32 (4) + compressed_size (4) + uncompressed_size (4)
 // Returns 0 on success, -1 on error
-// Note: Currently unused but available for future full streaming mode support
-__attribute__((unused)) static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out) {
+static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out) {
     uint8_t buf[16];
     ssize_t n = arc_stream_read(stream, buf, 4);
     if (n != 4) {
         return -1;
     }
-    
+
     uint32_t first_word = read_le32(buf);
     int offset = 0;
-    
+
     // Check for optional signature (0x08074b50)
     if (first_word == 0x08074b50) {
         // Signature present, read the rest
@@ -653,7 +652,7 @@ __attribute__((unused)) static int read_data_descriptor(ArcStream *stream, uint3
         }
         offset = -4; // We already read CRC32 in first_word
     }
-    
+
     if (offset == 0) {
         // Signature was present, read CRC32 from buf[0-3]
         *crc32_out = read_le32(buf);
@@ -665,7 +664,7 @@ __attribute__((unused)) static int read_data_descriptor(ArcStream *stream, uint3
         *compressed_size_out = read_le32(buf);
         *uncompressed_size_out = read_le32(buf + 4);
     }
-    
+
     return 0;
 }
 
@@ -919,35 +918,116 @@ static int zip_read_entry_streaming(ZipReader *reader) {
     if (entry.flags & ZIP_FLAG_DATA_DESCRIPTOR) {
         // Bit 3 is set: sizes are in data descriptor after compressed data
         // Local header sizes are unreliable (usually zero)
-        // We need to read through the compressed data to find the descriptor
-        //
-        // Note: For streaming mode (no central directory), handling data descriptors
-        // requires decompressing the entire entry to find the descriptor, which is
-        // complex. We require central directory for entries with bit 3 set.
-        // Most ZIPs (including streaming-created ones) have central directories.
-        
-        if (entry.compression_method == ZIP_METHOD_DEFLATE) {
-            // For deflate, we would need to decompress until end, then read descriptor
-            // This requires creating a deflate filter and reading until EOF
-            // Then read the 12-16 byte data descriptor
-            // For now, require central directory (which has correct sizes)
-            errno = EINVAL;
-            return -1; // Can't handle data descriptor in streaming mode without CD
-        } else if (entry.compression_method == ZIP_METHOD_STORE) {
-            // For store, we can't determine size without descriptor
-            // We'd need to read until we find the next local header or EOCD
-            // This is impractical - require central directory
-            errno = EINVAL;
-            return -1;
+
+        if (entry.compression_method == ZIP_METHOD_STORE) {
+            // For uncompressed data with data descriptor, we need to read until
+            // we find the data descriptor signature (0x08074b50) or next local header
+            int64_t current_pos = data_start;
+            const int64_t max_search = 1024 * 1024; // Limit search to 1MB to avoid excessive reading
+            int64_t search_limit = current_pos + max_search;
+
+            // Seek to start of data
+            if (arc_stream_seek(reader->base.stream, data_start, SEEK_SET) < 0) {
+                free_central_dir_entry(&entry);
+                return -1;
+            }
+
+            // Read in small chunks looking for data descriptor
+            uint8_t buf[1024];
+            uint32_t descriptor_sig = 0x08074b50;
+            bool found_descriptor = false;
+            uint32_t crc32 = 0;
+            uint64_t compressed_size_found = 0;
+            uint64_t uncompressed_size_found = 0;
+
+            while (current_pos < search_limit) {
+                ssize_t n = arc_stream_read(reader->base.stream, buf, sizeof(buf));
+                if (n <= 0) break;
+
+                // Look for data descriptor signature in the buffer
+                for (size_t i = 0; i < (size_t)n - 3; i++) {
+                    if (read_le32(buf + i) == descriptor_sig) {
+                        // Found data descriptor, read the data
+                        int64_t descriptor_pos = current_pos + i;
+                        if (arc_stream_seek(reader->base.stream, descriptor_pos + 4, SEEK_SET) == 0) {
+                            if (read_data_descriptor(reader->base.stream, &crc32, &compressed_size_found, &uncompressed_size_found) == 0) {
+                                found_descriptor = true;
+                                compressed_size = compressed_size_found;
+                                next_header_pos = descriptor_pos + (compressed_size_found > 0xFFFFFFFF ? 24 : 16); // Size of descriptor
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (found_descriptor) break;
+                current_pos += n;
+
+                // If we read less than buffer size, we're at EOF
+                if (n < (ssize_t)sizeof(buf)) break;
+            }
+
+            if (!found_descriptor) {
+                // Couldn't find data descriptor, fall back to local header size
+                compressed_size = entry.has_zip64_fields ?
+                               (int64_t)entry.zip64_compressed_size :
+                               (int64_t)entry.compressed_size;
+                next_header_pos = data_start + compressed_size;
+            }
+
+        } else if (entry.compression_method == ZIP_METHOD_DEFLATE) {
+            // For compressed data, we need to create a filter and read until EOF,
+            // then look for the data descriptor
+            ArcStream *temp_stream = arc_stream_substream(reader->base.stream, data_start, -1); // Unlimited
+            if (temp_stream) {
+                ArcStream *decomp = arc_filter_deflate(temp_stream, 0); // No limit for detection
+                if (decomp) {
+                    // Read all decompressed data to find where compressed data ends
+                    uint8_t temp_buf[4096];
+                    ssize_t total_decompressed = 0;
+                    while (arc_stream_read(decomp, temp_buf, sizeof(temp_buf)) > 0) {
+                        total_decompressed += sizeof(temp_buf);
+                        // Limit to reasonable size to avoid excessive memory use
+                        if (total_decompressed > 100 * 1024 * 1024) break; // 100MB limit
+                    }
+                    arc_stream_close(decomp);
+
+                    // Now try to read data descriptor from the underlying stream
+                    uint32_t crc32;
+                    uint64_t compressed_size_found, uncompressed_size_found;
+                    if (read_data_descriptor(reader->base.stream, &crc32, &compressed_size_found, &uncompressed_size_found) == 0) {
+                        compressed_size = compressed_size_found;
+                        next_header_pos = data_start + compressed_size;
+                    } else {
+                        // Fallback to local header size
+                        compressed_size = entry.has_zip64_fields ?
+                                       (int64_t)entry.zip64_compressed_size :
+                                       (int64_t)entry.compressed_size;
+                        next_header_pos = data_start + compressed_size;
+                    }
+                } else {
+                    arc_stream_close(temp_stream);
+                    free_central_dir_entry(&entry);
+                    return -1;
+                }
+                arc_stream_close(temp_stream);
+            } else {
+                free_central_dir_entry(&entry);
+                return -1;
+            }
         } else {
             // Unknown compression method with data descriptor
             errno = EINVAL;
+            free_central_dir_entry(&entry);
             return -1;
         }
+
+        reader->stream_pos = next_header_pos;
+
     } else {
         // Normal case: use sizes from local header
-        compressed_size = entry.has_zip64_fields ? 
-                           (int64_t)entry.zip64_compressed_size : 
+        compressed_size = entry.has_zip64_fields ?
+                           (int64_t)entry.zip64_compressed_size :
                            (int64_t)entry.compressed_size;
         next_header_pos = data_start + compressed_size;
         reader->stream_pos = next_header_pos;

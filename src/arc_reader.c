@@ -2,6 +2,7 @@
 #include "arc_tar.h"
 #include "arc_zip.h"
 #include "arc_compressed.h"
+#include "arc_7z.h"
 #include "arc_filter.h"
 #include "arc_base.h"
 
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <errno.h>
 
 // Forward declarations
 static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compression_type, const char *path);
@@ -58,6 +60,23 @@ static bool verify_tar_checksum(const uint8_t *header) {
     return sum == stored;
 }
 
+static bool path_looks_like_tar(const char *path) {
+    if (!path) {
+        return false;
+    }
+    const char *ext = strrchr(path, '.');
+    if (!ext) {
+        return false;
+    }
+    if (strstr(path, ".tar.") != NULL ||
+        strcmp(ext, ".tgz") == 0 ||
+        strcmp(ext, ".tbz2") == 0 ||
+        strcmp(ext, ".txz") == 0) {
+        return true;
+    }
+    return false;
+}
+
 // Default limits (safe baseline)
 static const ArcLimits ARC_DEFAULT_LIMITS = {
     .max_entries = 1000000ULL,
@@ -85,10 +104,11 @@ static const ArcLimits *normalize_limits(const ArcLimits *in) {
 }
 
 
-// Format types (must match arc_tar.c, arc_zip.c, and arc_compressed.c)
+// Format types (must match arc_tar.c, arc_zip.c, arc_compressed.c, arc_7z.c)
 #define ARC_FORMAT_TAR 0
 #define ARC_FORMAT_ZIP 1
 #define ARC_FORMAT_COMPRESSED 2
+#define ARC_FORMAT_7Z 3
 
 int arc_next(ArcReader *reader, ArcEntry *entry) {
     if (!reader || !entry) {
@@ -103,6 +123,8 @@ int arc_next(ArcReader *reader, ArcEntry *entry) {
             return arc_zip_next(reader, entry);
         case ARC_FORMAT_COMPRESSED:
             return arc_compressed_next(reader, entry);
+        case ARC_FORMAT_7Z:
+            return arc_7z_next(reader, entry);
         default:
             return -1;
     }
@@ -128,6 +150,8 @@ ArcStream *arc_open_data(ArcReader *reader) {
             return arc_zip_open_data(reader);
         case ARC_FORMAT_COMPRESSED:
             return arc_compressed_open_data(reader);
+        case ARC_FORMAT_7Z:
+            return arc_7z_open_data(reader);
         default:
             return NULL;
     }
@@ -145,6 +169,8 @@ int arc_skip_data(ArcReader *reader) {
             return arc_zip_skip_data(reader);
         case ARC_FORMAT_COMPRESSED:
             return arc_compressed_skip_data(reader);
+        case ARC_FORMAT_7Z:
+            return arc_7z_skip_data(reader);
         default:
             return -1;
     }
@@ -160,9 +186,12 @@ void arc_close(ArcReader *reader) {
             case ARC_FORMAT_ZIP:
                 arc_zip_close(reader);
                 break;
-            case ARC_FORMAT_COMPRESSED:
-                arc_compressed_close(reader);
-                break;
+        case ARC_FORMAT_COMPRESSED:
+            arc_compressed_close(reader);
+            break;
+        case ARC_FORMAT_7Z:
+            arc_7z_close(reader);
+            break;
             default:
                 // Unknown format, try all (one will fail gracefully)
                 arc_tar_close(reader);
@@ -238,6 +267,8 @@ ArcReader *arc_open_path_ex(const char *path, const ArcLimits *limits_in) {
             decompressed = arc_filter_gzip(stream, (int64_t)limits->max_uncompressed_bytes);
         } else if (compression_type == ARC_COMPRESSED_BZIP2) {
             decompressed = arc_filter_bzip2(stream, (int64_t)limits->max_uncompressed_bytes);
+        } else if (compression_type == ARC_COMPRESSED_XZ) {
+            decompressed = arc_filter_xz(stream, (int64_t)limits->max_uncompressed_bytes);
         }
         if (!decompressed) {
             arc_stream_close(stream);
@@ -306,10 +337,11 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
     ArcStream *original_stream = stream;
     
     // Read first few bytes to detect compression
-    uint8_t magic[4];
+    uint8_t magic[6];
     int64_t pos = arc_stream_tell(stream);
     ssize_t n = arc_stream_read(stream, magic, sizeof(magic));
     if (n < 2) {
+        errno = EINVAL;
         return -1;
     }
     
@@ -328,7 +360,12 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         stream = *decompressed;
         n = arc_stream_read(stream, magic, sizeof(magic));
         if (n < 2) {
-            return -1;
+            *compression_type = detected_compression;
+            if (path_looks_like_tar(path)) {
+                errno = EINVAL;
+                return -1;
+            }
+            return ARC_FORMAT_COMPRESSED;
         }
     }
     // Check for bzip2 (BZ)
@@ -343,15 +380,33 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         stream = *decompressed;
         n = arc_stream_read(stream, magic, sizeof(magic));
         if (n < 2) {
-            return -1;
+            *compression_type = detected_compression;
+            if (path_looks_like_tar(path)) {
+                errno = EINVAL;
+                return -1;
+            }
+            return ARC_FORMAT_COMPRESSED;
         }
     }
-    // Check for xz (FD 37 7A 58 5A 00)
-    else if (magic[0] == 0xFD && magic[1] == 0x37 && n >= 4 &&
-             magic[2] == 0x7A && magic[3] == 0x58) {
-        // XZ not supported yet, but we could add it
-        arc_stream_seek(stream, pos, SEEK_SET);
-        return -1;
+    // Check for xz (magic bytes FD 37 7A 58 5A 00)
+    else if (magic[0] == 0xFD && magic[1] == 0x37 && n >= 6 &&
+             magic[2] == 0x7A && magic[3] == 0x58 && magic[4] == 0x5A && magic[5] == 0x00) {
+        detected_compression = ARC_COMPRESSED_XZ;
+        arc_stream_seek(original_stream, 0, SEEK_SET);
+        *decompressed = arc_filter_xz(original_stream, 0);
+        if (!*decompressed) {
+            return -1;
+        }
+        stream = *decompressed;
+        n = arc_stream_read(stream, magic, sizeof(magic));
+        if (n < 2) {
+            *compression_type = detected_compression;
+            if (path_looks_like_tar(path)) {
+                errno = EINVAL;
+                return -1;
+            }
+            return ARC_FORMAT_COMPRESSED;
+        }
     } else {
         // No compression, reset position
         arc_stream_seek(stream, pos, SEEK_SET);
@@ -381,11 +436,37 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         }
     }
     
+    // 7z: Check for signature
+    if (n >= 6 && memcmp(magic, "\x37\x7A\xBC\xAF\x27\x1C", 6) == 0) {
+        arc_stream_seek(stream, pos, SEEK_SET);
+        return ARC_FORMAT_7Z;
+    }
+
     // TAR: Check for ustar magic or valid TAR checksum
     // Read first 512 bytes to check TAR header
     uint8_t header[512];
     pos = arc_stream_tell(stream);
-    n = arc_stream_read(stream, header, sizeof(header));
+    if (detected_compression >= 0) {
+        // For filter streams we cannot seek, so preserve the already-read bytes.
+        size_t filled = 0;
+        if (n > 0) {
+            size_t magic_len = (size_t)n;
+            if (magic_len > sizeof(header)) {
+                magic_len = sizeof(header);
+            }
+            memcpy(header, magic, magic_len);
+            filled = magic_len;
+        }
+        if (filled < sizeof(header)) {
+            ssize_t more = arc_stream_read(stream, header + filled, sizeof(header) - filled);
+            if (more > 0) {
+                filled += (size_t)more;
+            }
+        }
+        n = (filled == sizeof(header)) ? (ssize_t)sizeof(header) : (ssize_t)filled;
+    } else {
+        n = arc_stream_read(stream, header, sizeof(header));
+    }
     if (n == sizeof(header)) {
         // Reject all-zero blocks (end of archive marker, not a valid header)
         if (is_tar_zero_block(header)) {
@@ -426,26 +507,21 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         *compression_type = detected_compression;
         // Check if path suggests it's a TAR archive (e.g., .tar.gz, .tar.bz2)
         // If so, don't treat as single compressed file
-        if (path) {
-            const char *ext = strrchr(path, '.');
-            if (ext) {
-                // Check for .tar.gz, .tar.bz2, etc.
-                if (strstr(path, ".tar.") != NULL || 
-                    strcmp(ext, ".tgz") == 0 || 
-                    strcmp(ext, ".tbz2") == 0 ||
-                    strcmp(ext, ".txz") == 0) {
-                    // Looks like a TAR archive, but we didn't detect TAR format
-                    // This is an error - corrupted or unsupported
-                    arc_stream_seek(stream, pos, SEEK_SET);
-                    return -1;
-                }
-            }
+        if (path_looks_like_tar(path)) {
+            // Looks like a TAR archive, but we didn't detect TAR format
+            // This is an error - corrupted or unsupported
+            arc_stream_seek(stream, pos, SEEK_SET);
+            errno = EINVAL;
+            return -1;
         }
         arc_stream_seek(stream, pos, SEEK_SET);
         return ARC_FORMAT_COMPRESSED;
     }
     
     arc_stream_seek(stream, pos, SEEK_SET);
+    if (errno == 0) {
+        errno = EINVAL;
+    }
     return -1; // Unknown format
 }
 
@@ -474,6 +550,12 @@ static ArcReader *create_reader(ArcStream *stream, int format, const char *path,
                 ((ArcReaderBase *)reader)->limits = limits;
             }
             return reader;
+        case ARC_FORMAT_7Z:
+        {
+            ArcReader *r = arc_7z_open_ex(stream, limits);
+            if (r) ((ArcReaderBase *)r)->limits = limits;
+            return r;
+        }
         default:
             return NULL;
     }

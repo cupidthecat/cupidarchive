@@ -341,14 +341,6 @@ ArcStream *arc_filter_bzip2(ArcStream *underlying, int64_t byte_limit) {
     return stream;
 }
 
-ArcStream *arc_filter_xz(ArcStream *underlying, int64_t byte_limit) {
-    // TODO: Implement xz/lzma support when liblzma is available
-    (void)underlying;
-    (void)byte_limit;
-    errno = ENOSYS;
-    return NULL;
-}
-
 // Raw deflate filter implementation (for ZIP format)
 static ssize_t deflate_read(ArcStream *stream, void *buf, size_t n);
 static int deflate_seek(ArcStream *stream, int64_t off, int whence);
