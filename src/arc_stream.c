@@ -66,7 +66,20 @@ static ssize_t fd_read(ArcStream *stream, void *buf, size_t n) {
     ssize_t ret = read(data->fd, buf, n);
     if (ret > 0) {
         stream->bytes_read += ret;
-        data->pos += ret;
+        // Update position based on actual file position (in case of seeks)
+        off_t actual_pos = lseek(data->fd, 0, SEEK_CUR);
+        if (actual_pos != (off_t)-1) {
+            data->pos = actual_pos;
+        } else {
+            // Fallback: update by bytes read
+            data->pos += ret;
+        }
+    } else if (ret == 0) {
+        // EOF - update position to actual file position
+        off_t actual_pos = lseek(data->fd, 0, SEEK_CUR);
+        if (actual_pos != (off_t)-1) {
+            data->pos = actual_pos;
+        }
     }
     return ret;
 }
@@ -78,6 +91,11 @@ static int fd_seek(ArcStream *stream, int64_t off, int whence) {
         return -1;
     }
     data->pos = result;
+    // When seeking to the beginning, reset bytes_read to allow reading from start
+    // This is important when recreating filters after format detection
+    if (whence == SEEK_SET && off == 0) {
+        stream->bytes_read = 0;
+    }
     return 0;
 }
 

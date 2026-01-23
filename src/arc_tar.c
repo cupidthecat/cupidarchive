@@ -3,6 +3,7 @@
 #include "arc_reader.h"
 #include "arc_stream.h"
 #include "arc_filter.h"
+#include "arc_base.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -70,8 +71,7 @@ struct TarHeader {
 // TAR reader structure
 // Note: ArcReader is actually a TarReader (they're the same)
 typedef struct TarReader {
-    int format;  // ARC_FORMAT_TAR
-    ArcStream *stream;
+    ArcReaderBase base;  // Must be first member for safe dispatch
     ArcEntry current_entry;
     bool entry_valid;
     int64_t entry_data_offset;
@@ -197,35 +197,80 @@ static int tar_read_entry(struct TarReader *reader) {
     }
     
     // Skip any remaining entry data
+    // For filter streams (gzip/bzip2), we can't seek, so read and discard
     if (reader->entry_data_remaining > 0) {
-        if (arc_stream_seek(reader->stream, reader->entry_data_remaining, SEEK_CUR) < 0) {
-            return -1;
+        // Try seeking first (works for regular streams)
+        if (arc_stream_seek(reader->base.stream, reader->entry_data_remaining, SEEK_CUR) < 0) {
+            // Seek failed (filter stream) - read and discard instead
+            char discard[8192];
+            int64_t remaining = reader->entry_data_remaining;
+            while (remaining > 0) {
+                size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                ssize_t n = arc_stream_read(reader->base.stream, discard, to_read);
+                if (n <= 0) {
+                    break; // EOF or error
+                }
+                remaining -= n;
+            }
         }
         // Round up to block boundary
         int64_t skip = (TAR_BLOCK_SIZE - (reader->entry_data_remaining % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
         if (skip > 0) {
-            if (arc_stream_seek(reader->stream, skip, SEEK_CUR) < 0) {
-                return -1;
+            if (arc_stream_seek(reader->base.stream, skip, SEEK_CUR) < 0) {
+                // Seek failed - read and discard padding
+                char discard[512];
+                int64_t remaining = skip;
+                while (remaining > 0) {
+                    size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                    ssize_t n = arc_stream_read(reader->base.stream, discard, to_read);
+                    if (n <= 0) {
+                        break;
+                    }
+                    remaining -= n;
+                }
             }
         }
     }
     
     // Read header block
     struct TarHeader hdr;
-    ssize_t n = arc_stream_read(reader->stream, &hdr, sizeof(hdr));
+    memset(&hdr, 0, sizeof(hdr)); // Initialize to zero
+    ssize_t n = arc_stream_read(reader->base.stream, &hdr, sizeof(hdr));
     if (n < 0) {
-        return -1;
+        return -1; // Read error
     }
-    if (n == 0 || is_zero_block((const uint8_t *)&hdr)) {
+    if (n == 0) {
+        // EOF reached
         reader->eof = true;
         return 1; // Done
     }
     if (n != sizeof(hdr)) {
+        // Partial read - this shouldn't happen for a valid TAR
+        // This can happen if the filter stream isn't reading correctly
         return -1;
     }
     
+    // Check for zero block (end of archive)
+    if (is_zero_block((const uint8_t *)&hdr)) {
+        reader->eof = true;
+        return 1; // Done
+    }
+    
     // Verify checksum
+    // Note: Checksum verification can fail if:
+    // 1. The stream position is wrong (reading from wrong offset)
+    // 2. The header is corrupted
+    // 3. The filter stream isn't decompressing correctly
     if (!verify_checksum(&hdr)) {
+        // Checksum failed - might be corrupted or not a TAR file
+        // This can happen if the stream position is wrong or the header is corrupted
+        // For debugging: check if we got any valid data
+        if (hdr.name[0] == '\0' && is_zero_block((const uint8_t *)&hdr)) {
+            // Actually a zero block, should have been caught earlier
+            reader->eof = true;
+            return 1;
+        }
+        // Checksum mismatch - likely stream position issue or corrupted data
         return -1;
     }
     
@@ -240,7 +285,7 @@ static int tar_read_entry(struct TarReader *reader) {
     if (hdr.typeflag == TAR_XHDTYPE || hdr.typeflag == TAR_XGLTYPE) {
         // Read pax header
         uint64_t pax_header_size = parse_octal(hdr.size, TAR_SIZE_SIZE);
-        if (read_pax_header(reader->stream, &pax_path, &pax_size) < 0) {
+        if (read_pax_header(reader->base.stream, &pax_path, &pax_size) < 0) {
             free(pax_path);
             return -1;
         }
@@ -248,14 +293,24 @@ static int tar_read_entry(struct TarReader *reader) {
         // Skip to next block
         int64_t skip = (TAR_BLOCK_SIZE - (pax_header_size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
         if (skip > 0) {
-            if (arc_stream_seek(reader->stream, skip, SEEK_CUR) < 0) {
-                free(pax_path);
-                return -1;
+            if (arc_stream_seek(reader->base.stream, skip, SEEK_CUR) < 0) {
+                // Seek failed (filter stream) - read and discard padding
+                char discard[512];
+                int64_t remaining = skip;
+                while (remaining > 0) {
+                    size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                    ssize_t n = arc_stream_read(reader->base.stream, discard, to_read);
+                    if (n <= 0) {
+                        free(pax_path);
+                        return -1;
+                    }
+                    remaining -= n;
+                }
             }
         }
         
         // Read next header (actual entry)
-        n = arc_stream_read(reader->stream, &hdr, sizeof(hdr));
+        n = arc_stream_read(reader->base.stream, &hdr, sizeof(hdr));
         if (n < 0 || n != sizeof(hdr)) {
             free(pax_path);
             return -1;
@@ -310,7 +365,7 @@ static int tar_read_entry(struct TarReader *reader) {
     }
     
     reader->entry_valid = true;
-    reader->entry_data_offset = arc_stream_tell(reader->stream);
+    reader->entry_data_offset = arc_stream_tell(reader->base.stream);
     reader->entry_data_remaining = size;
     
     return 0;
@@ -326,14 +381,35 @@ int arc_tar_next(ArcReader *reader, ArcEntry *entry) {
     // If we have a valid entry with data remaining, we need to skip it first
     if (tar->entry_valid && tar->entry_data_remaining > 0) {
         // Skip the previous entry's data before reading next
-        if (arc_stream_seek(tar->stream, tar->entry_data_remaining, SEEK_CUR) < 0) {
-            return -1;
+        // For filter streams (gzip/bzip2), we can't seek, so read and discard
+        if (arc_stream_seek(tar->base.stream, tar->entry_data_remaining, SEEK_CUR) < 0) {
+            // Seek failed (filter stream) - read and discard instead
+            char discard[8192];
+            int64_t remaining = tar->entry_data_remaining;
+            while (remaining > 0) {
+                size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                ssize_t n = arc_stream_read(tar->base.stream, discard, to_read);
+                if (n <= 0) {
+                    break; // EOF or error
+                }
+                remaining -= n;
+            }
         }
         // Round up to block boundary
         int64_t skip = (TAR_BLOCK_SIZE - (tar->entry_data_remaining % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
         if (skip > 0) {
-            if (arc_stream_seek(tar->stream, skip, SEEK_CUR) < 0) {
-                return -1;
+            if (arc_stream_seek(tar->base.stream, skip, SEEK_CUR) < 0) {
+                // Seek failed - read and discard padding
+                char discard[512];
+                int64_t remaining = skip;
+                while (remaining > 0) {
+                    size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                    ssize_t n = arc_stream_read(tar->base.stream, discard, to_read);
+                    if (n <= 0) {
+                        break;
+                    }
+                    remaining -= n;
+                }
             }
         }
         tar->entry_data_remaining = 0;
@@ -365,7 +441,7 @@ ArcStream *arc_tar_open_data(ArcReader *reader) {
     // Create substream for entry data
     // Note: We don't invalidate entry_valid here - it will be invalidated
     // when arc_next() is called again or arc_skip_data() is called
-    return arc_stream_substream(tar->stream, tar->entry_data_offset, tar->entry_data_remaining);
+    return arc_stream_substream(tar->base.stream, tar->entry_data_offset, tar->entry_data_remaining);
 }
 
 int arc_tar_skip_data(ArcReader *reader) {
@@ -377,16 +453,36 @@ int arc_tar_skip_data(ArcReader *reader) {
         return -1;
     }
     
-    // Seek past entry data
-    if (arc_stream_seek(tar->stream, tar->entry_data_remaining, SEEK_CUR) < 0) {
-        return -1;
+    // Seek past entry data (or read and discard for filter streams)
+    if (arc_stream_seek(tar->base.stream, tar->entry_data_remaining, SEEK_CUR) < 0) {
+        // Seek failed (filter stream) - read and discard instead
+        char discard[8192];
+        int64_t remaining = tar->entry_data_remaining;
+        while (remaining > 0) {
+            size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+            ssize_t n = arc_stream_read(tar->base.stream, discard, to_read);
+            if (n <= 0) {
+                break; // EOF or error
+            }
+            remaining -= n;
+        }
     }
     
     // Round up to block boundary
     int64_t skip = (TAR_BLOCK_SIZE - (tar->entry_data_remaining % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
     if (skip > 0) {
-        if (arc_stream_seek(tar->stream, skip, SEEK_CUR) < 0) {
-            return -1;
+        if (arc_stream_seek(tar->base.stream, skip, SEEK_CUR) < 0) {
+            // Seek failed - read and discard padding
+            char discard[512];
+            int64_t remaining = skip;
+            while (remaining > 0) {
+                size_t to_read = (remaining > (int64_t)sizeof(discard)) ? sizeof(discard) : (size_t)remaining;
+                ssize_t n = arc_stream_read(tar->base.stream, discard, to_read);
+                if (n <= 0) {
+                    break;
+                }
+                remaining -= n;
+            }
         }
     }
     
@@ -401,7 +497,7 @@ void arc_tar_close(ArcReader *reader) {
     }
     TarReader *tar = (TarReader *)reader;
     arc_entry_free(&tar->current_entry);
-    arc_stream_close(tar->stream);
+    arc_stream_close(tar->base.stream);
     free(tar);
 }
 
@@ -416,35 +512,18 @@ ArcReader *arc_tar_open(ArcStream *stream) {
         return NULL;
     }
     
-    tar->format = ARC_FORMAT_TAR;
-    tar->stream = stream;
+    tar->base.format = ARC_FORMAT_TAR;
+    tar->base.stream = stream;
     tar->entry_valid = false;
     tar->eof = false;
     
     // Cast to ArcReader (they're the same structure)
     ArcReader *reader = (ArcReader *)tar;
     
-    // Verify TAR magic
-    struct TarHeader hdr;
-    int64_t pos = arc_stream_tell(stream);
-    ssize_t n = arc_stream_read(stream, &hdr, sizeof(hdr));
-    if (n != sizeof(hdr)) {
-        free(tar);
-        return NULL;
-    }
-    
-    // Check for ustar magic
-    if (memcmp(hdr.magic, "ustar", 5) != 0 && memcmp(hdr.magic, "USTAR", 5) != 0) {
-        // Not ustar, might be old format - check if it looks like TAR
-        // Old TAR doesn't have magic, but has reasonable header
-        if (hdr.name[0] == '\0' || !isprint(hdr.name[0])) {
-            free(tar);
-            return NULL;
-        }
-    }
-    
-    // Reset position
-    arc_stream_seek(stream, pos, SEEK_SET);
+    // Format detection already verified this is a TAR file and reset the stream position.
+    // For filter streams (gzip/bzip2), we can't seek, so we trust format detection.
+    // Just ensure we start reading from the beginning - tar_read_entry will handle the first read.
+    // No need to verify again here since format detection already did it.
     
     return reader;
 }

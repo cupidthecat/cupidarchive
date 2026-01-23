@@ -3,6 +3,7 @@
 #include "arc_reader.h"
 #include "arc_stream.h"
 #include "arc_filter.h"
+#include "arc_base.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -105,8 +106,7 @@ struct Zip64EOCDRecord {
 
 // ZIP reader structure
 typedef struct ZipReader {
-    int format;  // ARC_FORMAT_ZIP
-    ArcStream *stream;
+    ArcReaderBase base;  // Must be first member for safe dispatch
     ArcEntry current_entry;
     bool entry_valid;
     int64_t entry_data_offset;
@@ -760,14 +760,14 @@ static int zip_read_entry_streaming(ZipReader *reader) {
     }
     
     // Seek to current position
-    if (arc_stream_seek(reader->stream, reader->stream_pos, SEEK_SET) < 0) {
+    if (arc_stream_seek(reader->base.stream, reader->stream_pos, SEEK_SET) < 0) {
         reader->eof = true;
         return 1;
     }
     
     struct ZipCentralDirEntry entry;
     int64_t header_pos;
-    if (read_local_file_header(reader->stream, &header_pos, &entry) < 0) {
+    if (read_local_file_header(reader->base.stream, &header_pos, &entry) < 0) {
         reader->eof = true;
         return 1; // End of archive or error
     }
@@ -880,13 +880,13 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
     }
     
     // Seek to local file header
-    if (arc_stream_seek(zip->stream, zip->entry_data_offset, SEEK_SET) < 0) {
+    if (arc_stream_seek(zip->base.stream, zip->entry_data_offset, SEEK_SET) < 0) {
         return NULL;
     }
     
     // Read local file header
     uint8_t header[30];
-    ssize_t n = arc_stream_read(zip->stream, header, sizeof(header));
+    ssize_t n = arc_stream_read(zip->base.stream, header, sizeof(header));
     if (n != sizeof(header)) {
         return NULL;
     }
@@ -901,15 +901,15 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
     
     // Skip filename and extra field
     int64_t skip = filename_length + extra_field_length;
-    if (arc_stream_seek(zip->stream, skip, SEEK_CUR) < 0) {
+    if (arc_stream_seek(zip->base.stream, skip, SEEK_CUR) < 0) {
         return NULL;
     }
     
     // Get current position (start of file data)
-    int64_t data_start = arc_stream_tell(zip->stream);
+    int64_t data_start = arc_stream_tell(zip->base.stream);
     
     // Create substream for entry data
-    ArcStream *data_stream = arc_stream_substream(zip->stream, data_start, zip->entry_data_remaining);
+    ArcStream *data_stream = arc_stream_substream(zip->base.stream, data_start, zip->entry_data_remaining);
     if (!data_stream) {
         return NULL;
     }
@@ -971,7 +971,7 @@ void arc_zip_close(ArcReader *reader) {
         free(zip->stream_entries);
     }
     
-    arc_stream_close(zip->stream);
+    arc_stream_close(zip->base.stream);
     free(zip);
 }
 
@@ -985,8 +985,8 @@ ArcReader *arc_zip_open(ArcStream *stream) {
         return NULL;
     }
     
-    zip->format = ARC_FORMAT_ZIP;
-    zip->stream = stream;
+    zip->base.format = ARC_FORMAT_ZIP;
+    zip->base.stream = stream;
     zip->entry_valid = false;
     zip->eof = false;
     zip->current_entry_index = 0;

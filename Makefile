@@ -11,8 +11,8 @@ OBJDIR = obj
 LIBDIR = .
 
 # Source files
-SOURCES = $(SRCDIR)/arc_stream.c $(SRCDIR)/arc_filter.c $(SRCDIR)/arc_tar.c $(SRCDIR)/arc_zip.c $(SRCDIR)/arc_reader.c $(SRCDIR)/arc_extract.c
-OBJECTS = $(OBJDIR)/arc_stream.o $(OBJDIR)/arc_filter.o $(OBJDIR)/arc_tar.o $(OBJDIR)/arc_zip.o $(OBJDIR)/arc_reader.o $(OBJDIR)/arc_extract.o
+SOURCES = $(SRCDIR)/arc_stream.c $(SRCDIR)/arc_filter.c $(SRCDIR)/arc_tar.c $(SRCDIR)/arc_zip.c $(SRCDIR)/arc_compressed.c $(SRCDIR)/arc_reader.c $(SRCDIR)/arc_extract.c
+OBJECTS = $(OBJDIR)/arc_stream.o $(OBJDIR)/arc_filter.o $(OBJDIR)/arc_tar.o $(OBJDIR)/arc_zip.o $(OBJDIR)/arc_compressed.o $(OBJDIR)/arc_reader.o $(OBJDIR)/arc_extract.o
 
 # Library
 LIBRARY = libcupidarchive.a
