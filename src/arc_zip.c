@@ -15,11 +15,7 @@
 #include <stdint.h>
 #include <limits.h>
 
-// Security limits to prevent OOM attacks
-#define ZIP_MAX_ENTRIES 1000000UL          // Maximum number of entries
-#define ZIP_MAX_FILENAME_LENGTH 4096       // Maximum filename length
-#define ZIP_MAX_EXTRA_FIELD_LENGTH 65534   // Max extra field (uint16_t max is 65535)
-#define ZIP_MAX_COMMENT_LENGTH 65534       // Max comment (uint16_t max is 65535)
+// Note: Security/resource limits are provided via ArcLimits (ArcReaderBase.limits).
 
 // ZIP constants
 #define ZIP_LOCAL_FILE_HEADER_SIG   0x04034b50  // "PK\03\04"
@@ -275,7 +271,7 @@ static int read_zip64_eocd(ArcStream *stream, int64_t offset, struct Zip64EOCDRe
 }
 
 // Helper: Find End of Central Directory by scanning backwards
-static int find_eocd(ArcStream *stream, struct ZipEOCD *eocd, struct Zip64EOCDRecord *eocd64_out) {
+static int find_eocd(ArcStream *stream, struct ZipEOCD *eocd, struct Zip64EOCDRecord *eocd64_out, const ArcLimits *limits) {
     // Get stream size (if available)
     int64_t stream_size = -1;
     int64_t current_pos = arc_stream_tell(stream);
@@ -330,8 +326,8 @@ static int find_eocd(ArcStream *stream, struct ZipEOCD *eocd, struct Zip64EOCDRe
             eocd->central_dir_offset = read_le32(p + 16);
             eocd->comment_length = read_le16(p + 20);
             
-            // Security: Validate comment length
-            if (eocd->comment_length > ZIP_MAX_COMMENT_LENGTH) {
+            // Security: Validate comment length (use max_extra as a generic bound)
+            if (limits && limits->max_extra > 0 && (uint64_t)eocd->comment_length > limits->max_extra) {
                 errno = EOVERFLOW;
                 return -1;
             }
@@ -388,7 +384,7 @@ static void free_central_dir_entry(struct ZipCentralDirEntry *entry) {
 }
 
 // Helper: Read central directory entry
-static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *entry) {
+static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *entry, const ArcLimits *limits) {
     uint8_t header[46]; // Fixed part of central directory header
     
     ssize_t n = arc_stream_read(stream, header, sizeof(header));
@@ -419,15 +415,15 @@ static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *
     entry->local_header_offset = read_le32(header + 42);
     
     // Security: Validate field lengths to prevent excessive allocations
-    if (entry->filename_length > ZIP_MAX_FILENAME_LENGTH) {
+    if (limits && limits->max_name > 0 && (uint64_t)entry->filename_length > limits->max_name) {
         errno = EOVERFLOW;
         return -1;
     }
-    if (entry->extra_field_length > ZIP_MAX_EXTRA_FIELD_LENGTH) {
+    if (limits && limits->max_extra > 0 && (uint64_t)entry->extra_field_length > limits->max_extra) {
         errno = EOVERFLOW;
         return -1;
     }
-    if (entry->comment_length > ZIP_MAX_COMMENT_LENGTH) {
+    if (limits && limits->max_extra > 0 && (uint64_t)entry->comment_length > limits->max_extra) {
         errno = EOVERFLOW;
         return -1;
     }
@@ -502,9 +498,10 @@ static int read_central_dir_entry(ArcStream *stream, struct ZipCentralDirEntry *
 // Helper: Read all central directory entries
 static int read_central_directory(ArcStream *stream, int64_t offset, uint64_t count,
                                   int64_t stream_size, uint64_t central_dir_size,
-                                  struct ZipCentralDirEntry **entries_out, size_t *count_out) {
+                                  struct ZipCentralDirEntry **entries_out, size_t *count_out,
+                                  const ArcLimits *limits) {
     // Security: Check entry count limit
-    if (count > ZIP_MAX_ENTRIES) {
+    if (limits && limits->max_entries > 0 && count > limits->max_entries) {
         errno = EOVERFLOW;
         return -1;
     }
@@ -542,7 +539,7 @@ static int read_central_directory(ArcStream *stream, int64_t offset, uint64_t co
     }
     
     for (uint64_t i = 0; i < count; i++) {
-        if (read_central_dir_entry(stream, &entries[i]) < 0) {
+        if (read_central_dir_entry(stream, &entries[i], limits) < 0) {
             // Free what we've read so far
             for (uint64_t j = 0; j < i; j++) {
                 free_central_dir_entry(&entries[j]);
@@ -674,12 +671,12 @@ __attribute__((unused)) static int read_data_descriptor(ArcStream *stream, uint3
 
 // Forward declarations
 static int zip_read_entry_streaming(ZipReader *reader);
-static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry);
+static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry, const ArcLimits *limits);
 static int add_stream_entry(ZipReader *zip, const struct ZipCentralDirEntry *entry);
 static int read_data_descriptor(ArcStream *stream, uint32_t *crc32_out, uint64_t *compressed_size_out, uint64_t *uncompressed_size_out);
 
 // Helper: Read local file header (for streaming mode)
-static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry) {
+static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, struct ZipCentralDirEntry *entry, const ArcLimits *limits) {
     int64_t header_pos = arc_stream_tell(stream);
     if (header_pos < 0) {
         return -1;
@@ -708,11 +705,11 @@ static int read_local_file_header(ArcStream *stream, int64_t *header_pos_out, st
     uint16_t extra_field_length = read_le16(header + 28);
     
     // Security: Validate field lengths to prevent excessive allocations
-    if (filename_length > ZIP_MAX_FILENAME_LENGTH) {
+    if (limits && limits->max_name > 0 && (uint64_t)filename_length > limits->max_name) {
         errno = EOVERFLOW;
         return -1;
     }
-    if (extra_field_length > ZIP_MAX_EXTRA_FIELD_LENGTH) {
+    if (limits && limits->max_extra > 0 && (uint64_t)extra_field_length > limits->max_extra) {
         errno = EOVERFLOW;
         return -1;
     }
@@ -909,7 +906,7 @@ static int zip_read_entry_streaming(ZipReader *reader) {
     
     struct ZipCentralDirEntry entry;
     int64_t header_pos;
-    if (read_local_file_header(reader->base.stream, &header_pos, &entry) < 0) {
+    if (read_local_file_header(reader->base.stream, &header_pos, &entry, reader->base.limits) < 0) {
         reader->eof = true;
         return 1; // End of archive or error
     }
@@ -1092,7 +1089,13 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
     // Wrap with decompression filter if needed
     if (zip->entry_compression_method == ZIP_METHOD_DEFLATE) {
         // ZIP uses raw deflate (not gzip-wrapped)
-        ArcStream *decompressed = arc_filter_deflate(data_stream, zip->entry_uncompressed_size);
+        int64_t out_limit = zip->entry_uncompressed_size;
+        if (zip->base.limits && zip->base.limits->max_uncompressed_bytes > 0) {
+            if (out_limit <= 0 || (uint64_t)out_limit > zip->base.limits->max_uncompressed_bytes) {
+                out_limit = (int64_t)zip->base.limits->max_uncompressed_bytes;
+            }
+        }
+        ArcStream *decompressed = arc_filter_deflate(data_stream, out_limit);
         if (decompressed) {
             return decompressed;
         }
@@ -1151,6 +1154,10 @@ void arc_zip_close(ArcReader *reader) {
 }
 
 ArcReader *arc_zip_open(ArcStream *stream) {
+    return arc_zip_open_ex(stream, arc_default_limits());
+}
+
+ArcReader *arc_zip_open_ex(ArcStream *stream, const ArcLimits *limits) {
     if (!stream) {
         return NULL;
     }
@@ -1162,6 +1169,7 @@ ArcReader *arc_zip_open(ArcStream *stream) {
     
     zip->base.format = ARC_FORMAT_ZIP;
     zip->base.stream = stream;
+    zip->base.limits = limits;
     zip->entry_valid = false;
     zip->eof = false;
     zip->current_entry_index = 0;
@@ -1176,7 +1184,7 @@ ArcReader *arc_zip_open(ArcStream *stream) {
     struct Zip64EOCDRecord eocd64;
     memset(&eocd64, 0, sizeof(eocd64));
     
-    int eocd_found = find_eocd(stream, &eocd, &eocd64);
+    int eocd_found = find_eocd(stream, &eocd, &eocd64, limits);
     
     if (eocd_found == 0) {
         // Central directory available - use it (faster)
@@ -1199,7 +1207,7 @@ ArcReader *arc_zip_open(ArcStream *stream) {
         
         // Read central directory (with security checks)
         if (read_central_directory(stream, cd_offset, cd_count, stream_size, cd_size,
-                                   &zip->entries, &zip->entry_count) < 0) {
+                                   &zip->entries, &zip->entry_count, limits) < 0) {
             free(eocd.comment);
             free(zip);
             return NULL;

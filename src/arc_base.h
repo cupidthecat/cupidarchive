@@ -3,6 +3,8 @@
 
 #include "arc_stream.h"
 
+typedef struct ArcLimits ArcLimits;
+
 /**
  * Base structure for all archive readers.
  * This must be the first member of every reader struct to ensure
@@ -12,6 +14,7 @@ typedef struct ArcReaderBase {
     int format;              // Archive format identifier (ARC_FORMAT_*)
     ArcStream *stream;        // The stream the format reads from
     ArcStream *owned_stream;  // For closing (optional)
+    const ArcLimits *limits;  // Safety/resource limits (may be NULL => defaults)
 } ArcReaderBase;
 
 /**

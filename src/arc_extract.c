@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "arc_reader.h"
 #include "arc_stream.h"
+#include "arc_base.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -31,10 +32,19 @@
  * @param path The path to validate
  * @return 0 if valid, -1 if invalid (sets errno to EINVAL)
  */
-static int validate_entry_path(const char *path) {
+static int validate_entry_path(const char *path, const ArcLimits *limits) {
     if (!path || path[0] == '\0') {
         errno = EINVAL;
         return -1;
+    }
+
+    // Enforce max name length (bytes)
+    if (limits && limits->max_name > 0) {
+        size_t n = strlen(path);
+        if ((uint64_t)n > limits->max_name) {
+            errno = EOVERFLOW;
+            return -1;
+        }
     }
     
     // Reject absolute paths
@@ -46,6 +56,7 @@ static int validate_entry_path(const char *path) {
     // Check each component
     const char *start = path;
     const char *p = path;
+    uint64_t depth = 0;
     
     while (*p) {
         // Check for null bytes (shouldn't happen in normal strings, but be safe)
@@ -61,6 +72,7 @@ static int validate_entry_path(const char *path) {
                 errno = EINVAL;
                 return -1;
             }
+            if (comp_len > 0) depth++;
             start = p + 1;
         } else {
             // Check if we're at the start of a ".." component
@@ -80,6 +92,12 @@ static int validate_entry_path(const char *path) {
             errno = EINVAL;
             return -1;
         }
+        if (comp_len > 0) depth++;
+    }
+
+    if (limits && limits->max_nested_depth > 0 && depth > limits->max_nested_depth) {
+        errno = EOVERFLOW;
+        return -1;
     }
     
     return 0;
@@ -363,8 +381,10 @@ int arc_extract_entry(ArcReader *reader, const ArcEntry *entry, const char *dest
         return -1;
     }
     
+    const ArcLimits *limits = ((ArcReaderBase *)reader)->limits;
+
     // Validate entry path for security (prevent Zip-Slip attacks)
-    if (validate_entry_path(entry->path) < 0) {
+    if (validate_entry_path(entry->path, limits) < 0) {
         return -1;
     }
     
