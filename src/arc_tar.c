@@ -497,7 +497,14 @@ void arc_tar_close(ArcReader *reader) {
     }
     TarReader *tar = (TarReader *)reader;
     arc_entry_free(&tar->current_entry);
-    arc_stream_close(tar->base.stream);
+    if (tar->base.stream) {
+        arc_stream_close(tar->base.stream);
+        tar->base.stream = NULL;
+    }
+    if (tar->base.owned_stream) {
+        arc_stream_close(tar->base.owned_stream);
+        tar->base.owned_stream = NULL;
+    }
     free(tar);
 }
 

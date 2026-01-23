@@ -274,12 +274,15 @@ void arc_compressed_close(ArcReader *reader) {
     // Close decompressed stream (filter) first
     if (comp->decompressed) {
         arc_stream_close(comp->decompressed);
+        comp->decompressed = NULL;
+        comp->base.stream = NULL;
     }
-    
-    // Close original stream if we have it
-    // (filters don't close underlying streams, so we need to do it)
-    if (comp->original_stream) {
-        arc_stream_close(comp->original_stream);
+
+    // Close underlying/original stream if owned
+    if (comp->base.owned_stream) {
+        arc_stream_close(comp->base.owned_stream);
+        comp->base.owned_stream = NULL;
+        comp->original_stream = NULL;
     }
     
     free(comp->original_path);

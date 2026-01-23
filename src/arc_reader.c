@@ -261,6 +261,15 @@ ArcReader *arc_open_path_ex(const char *path, const ArcLimits *limits_in) {
         arc_stream_close(stream);
         return NULL;
     }
+
+    // If the format reads from a filter stream, ensure we also close the underlying file stream.
+    // Filters intentionally do not close their underlying stream for composability.
+    ArcReaderBase *base = (ArcReaderBase *)reader;
+    if (final_stream != stream) {
+        base->owned_stream = stream;
+    } else {
+        base->owned_stream = NULL;
+    }
     
     return reader;
 }

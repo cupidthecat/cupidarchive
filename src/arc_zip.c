@@ -1149,7 +1149,14 @@ void arc_zip_close(ArcReader *reader) {
         free(zip->stream_entries);
     }
     
-    arc_stream_close(zip->base.stream);
+    if (zip->base.stream) {
+        arc_stream_close(zip->base.stream);
+        zip->base.stream = NULL;
+    }
+    if (zip->base.owned_stream) {
+        arc_stream_close(zip->base.owned_stream);
+        zip->base.owned_stream = NULL;
+    }
     free(zip);
 }
 

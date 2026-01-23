@@ -10,7 +10,11 @@ CupidArchive provides a clean 3-layer architecture for reading archive files:
 2. **Filter Layer** - Decompression wrappers (gzip, bzip2, deflate, xz)
 3. **Format Layer** - Archive format parsers (TAR, ZIP)
 
-The library is designed with safety as a primary concern: every stream has a hard byte limit to prevent zip bomb attacks, and all operations are bounds-checked.
+The library is designed with safety as a primary concern:
+- **ArcLimits** are enforced across parsing, decompression, and extraction
+- Every stream has a **hard byte limit** to mitigate zip bombs
+- Extraction is **openat()-anchored** and rejects path traversal (Zip-Slip)
+- Decompression filters treat **truncated input as an error** (no silent partial output)
 
 ## Current Support
 
@@ -18,6 +22,23 @@ The library is designed with safety as a primary concern: every stream has a har
 - **Compression:** gzip (zlib), bzip2 (libbz2), deflate (zlib, for ZIP), xz/lzma (detection only, not implemented)
 - **Entry Types:** Regular files, directories, symlinks, hardlinks (TAR only), files and directories (ZIP)
 - **Operations:** Reading, previewing, and **extraction**
+
+## Limits (ArcLimits)
+
+Most public APIs use safe defaults, but you can pass explicit limits via the `_ex` APIs:
+
+```c
+const ArcLimits *arc_default_limits(void);
+ArcReader *arc_open_path_ex(const char *path, const ArcLimits *limits);
+ArcReader *arc_open_stream_ex(ArcStream *stream, const ArcLimits *limits);
+```
+
+Limits include:
+- `max_entries`: max entries parsed from ZIP central directory
+- `max_name`: max entry name/path bytes
+- `max_extra`: max ZIP extra/comment bytes
+- `max_uncompressed_bytes`: cap on decompressed output (zip-bomb mitigation)
+- `max_nested_depth`: max path depth (components) during extraction
 
 ## Architecture
 
@@ -86,6 +107,7 @@ The filter layer wraps underlying streams to provide decompression. Filters are 
 - Does NOT support seeking (returns ESPIPE)
 - Tracks decompressed bytes for `tell()` operation
 - Does NOT close underlying stream (caller owns it)
+- **Truncated input fails:** if input ends before `Z_STREAM_END`, returns `-1` and sets `errno = EINVAL`
 
 #### Bzip2 Filter (`arc_filter_bzip2`)
 
@@ -111,6 +133,7 @@ The filter layer wraps underlying streams to provide decompression. Filters are 
 - Does NOT support seeking (returns ESPIPE)
 - Tracks decompressed bytes for `tell()` operation
 - Does NOT close underlying stream (caller owns it)
+- **Truncated input fails:** if input ends before `Z_STREAM_END`, returns `-1` and sets `errno = EINVAL`
 
 ### Layer 3: Format Layer
 
@@ -179,18 +202,10 @@ The ZIP format implementation supports:
 - Uses 64-bit sizes and offsets when standard fields are 0xFFFFFFFF
 
 **ZIP Reader State:**
-```c
-typedef struct ZipReader {
-    ArcStream *stream;              // Underlying stream
-    ArcEntry current_entry;         // Current entry data
-    bool entry_valid;               // Whether entry data is available
-    int64_t entry_data_offset;      // Stream offset of entry data
-    int64_t entry_data_remaining;   // Bytes remaining in entry
-    bool eof;                        // End of archive reached
-    bool streaming_mode;            // Using streaming (local header) mode
-    // ... internal state for central directory or streaming
-} ZipReader;
-```
+Internals are not part of the public API (opaque `ArcReader`), but conceptually the ZIP reader tracks:
+- Current entry metadata + offsets
+- Whether it’s using central-directory mode vs streaming mode
+- Underlying stream (and optional owned underlying stream when wrapped by a filter)
 
 **Key Implementation Details:**
 - Entry data is NOT read automatically - must call `arc_open_data()` or `arc_skip_data()`
@@ -204,11 +219,10 @@ typedef struct ZipReader {
 The unified reader API provides format-agnostic access to archives.
 
 **Format Detection:**
-1. Reads first 4 bytes to detect compression
-2. Wraps stream with appropriate decompression filter if needed (gzip, bzip2)
-3. Checks for ZIP format first (magic bytes `'P' 'K'`)
-4. If not ZIP, reads first 512 bytes to check for TAR format
-5. Checks for ustar magic or old TAR format indicators
+1. Detects whole-file compression (gzip/bzip2) and **sniffs the decompressed header**
+2. Checks for ZIP first (PK signatures)
+3. Otherwise checks TAR via **ustar magic or valid TAR checksum** (and rejects all-zero blocks)
+4. Returns `{format, compression_type}` so callers can recreate a fresh filter for the real reader
 
 **Compression Detection:**
 - **Gzip:** Magic bytes `0x1f 0x8b`
@@ -220,10 +234,15 @@ The unified reader API provides format-agnostic access to archives.
 - `ARC_FORMAT_ZIP` (1) - ZIP format
 
 **Reader Lifecycle:**
-1. `arc_open_path()` or `arc_open_stream()` - Opens archive
+1. `arc_open_path()` / `arc_open_stream()` (or `*_ex` variants) - Opens archive
 2. `arc_next()` - Iterate through entries
 3. `arc_open_data()` or `arc_skip_data()` - Handle entry data
 4. `arc_close()` - Clean up
+
+**Ownership note (filtered streams):**
+Filters do not close their underlying stream for composability. Readers track this via:
+- `base.stream`: what the format reads (may be a filter)
+- `base.owned_stream`: underlying stream to also close (e.g. the file stream under a gzip filter)
 
 **Entry Management:**
 - `arc_next()` allocates `path` and `link_target` (caller must free)
@@ -238,7 +257,7 @@ The extraction layer provides full archive extraction capabilities.
 
 **`arc_extract_to_path()`**
 - Extracts all entries from an archive
-- Creates subdirectories as needed (`mkdir_p()`)
+- Creates subdirectories as needed using `mkdirat()` via an **openat()-anchored traversal**
 - Preserves permissions and timestamps (optional)
 - Returns error count (0 = success, >0 = some errors)
 
@@ -251,19 +270,20 @@ The extraction layer provides full archive extraction capabilities.
 #### Extraction Implementation Details
 
 **Directory Creation:**
-- Uses `mkdir_p()` to create parent directories recursively
+- Uses `mkdir_p_at()` (`openat()` + `mkdirat()`) to create parent directories recursively
 - Default mode: 0755
 - Handles existing directories gracefully (EEXIST)
+- Does **not** follow symlinks while traversing (`O_NOFOLLOW`)
 
 **File Extraction:**
 - Uses 64KB buffer for copying
-- Creates files with `O_WRONLY | O_CREAT | O_TRUNC`
+- Creates files with `openat(..., O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, ...)`
 - Preserves permissions if requested
-- Sets timestamps using `utime()` if requested
+- Sets timestamps using `futimens()` (fd-based) if requested
 
 **Symlink Extraction (TAR only):**
-- Removes existing file/symlink first (`unlink()`)
-- Creates symlink with `symlink()`
+- Removes existing file/symlink first (`unlinkat()`)
+- Creates symlink with `symlinkat()`
 - Does NOT preserve permissions (symlinks don't have separate permissions)
 - ZIP format does not support symlinks
 
@@ -273,9 +293,14 @@ The extraction layer provides full archive extraction capabilities.
 - ZIP format does not support hardlinks
 
 **Attribute Preservation:**
-- Permissions: `chmod()` with `mode & 0777` (only user/group/other bits)
-- Timestamps: `utime()` with mtime from entry
+- Permissions: `fchmod()` with `mode & 0777` (only user/group/other bits)
+- Timestamps: `futimens()` with mtime from entry
 - Ownership: Not currently preserved (would require `chown()` and root privileges)
+
+**Security:**
+- Rejects absolute paths and any `..` path components (Zip-Slip prevention)
+- All extraction operations are anchored to a destination directory fd (`openat()` family)
+- Uses `O_NOFOLLOW` during traversal and file creation to prevent symlink races
 
 ## API
 
@@ -434,7 +459,7 @@ The library expects:
 
 - **Full archive extraction:** `arc_extract_to_path()` extracts all entries
 - **Single entry extraction:** `arc_extract_entry()` extracts one entry at a time
-- **Directory creation:** Automatically creates parent directories as needed (`mkdir_p()`)
+- **Directory creation:** Automatically creates parent directories as needed (`mkdir_p_at()` via `openat()`/`mkdirat()`)
 - **Permission preservation:** Optional preservation of file permissions and ownership
 - **Timestamp preservation:** Optional preservation of modification times
 - **Symlink support:** Creates symlinks correctly (TAR format only)
