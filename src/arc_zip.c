@@ -608,6 +608,24 @@ static bool is_directory_name(const char *name) {
     return (len > 0 && name[len - 1] == '/');
 }
 
+// ZIP permission mapping:
+// - If "version made by" indicates Unix (host OS = 3), use external_attrs high 16 bits as st_mode.
+// - Otherwise synthesize sane defaults (dir 0755, file 0644).
+static uint32_t zip_entry_mode(const struct ZipCentralDirEntry *cd_entry) {
+    if (!cd_entry) return 0644;
+    const bool is_dir = is_directory_name(cd_entry->filename);
+
+    // host OS is high byte of version_made_by
+    const uint8_t host_os = (uint8_t)(cd_entry->version_made_by >> 8);
+    if (host_os == 3 /* Unix */) {
+        uint32_t mode = (cd_entry->external_attrs >> 16) & 0xFFFF;
+        // If mode is absent/zero, fall back to defaults.
+        if (mode != 0) return mode;
+    }
+
+    return is_dir ? 0755 : 0644;
+}
+
 // Helper: Read data descriptor (when bit 3 is set)
 // Data descriptor format: [optional 4-byte signature 0x08074b50] + CRC32 (4) + compressed_size (4) + uncompressed_size (4)
 // Returns 0 on success, -1 on error
@@ -844,7 +862,7 @@ static int zip_read_entry(ZipReader *reader) {
     }
     
     reader->current_entry.size = cd_entry->uncompressed_size;
-    reader->current_entry.mode = (cd_entry->external_attrs >> 16) & 0xFFFF; // Unix permissions
+    reader->current_entry.mode = zip_entry_mode(cd_entry);
     reader->current_entry.mtime = dos_datetime_to_unix(cd_entry->mod_date, cd_entry->mod_time);
     reader->current_entry.uid = 0; // ZIP doesn't store uid/gid
     reader->current_entry.gid = 0;
@@ -982,7 +1000,8 @@ static int zip_read_entry_streaming(ZipReader *reader) {
         reader->entry_data_remaining = (int64_t)cd_entry->compressed_size;
     }
     
-    reader->current_entry.mode = (cd_entry->external_attrs >> 16) & 0xFFFF;
+    // In streaming mode, we may not have reliable Unix metadata; use best-effort mapping.
+    reader->current_entry.mode = zip_entry_mode(cd_entry);
     reader->current_entry.mtime = dos_datetime_to_unix(cd_entry->mod_date, cd_entry->mod_time);
     reader->current_entry.uid = 0;
     reader->current_entry.gid = 0;
