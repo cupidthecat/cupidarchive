@@ -193,6 +193,20 @@ class Extraction(unittest.TestCase):
             result=subprocess.run([str(DRIVER),"byte-limit",str(archive),str(self.dest),str(len(raw)-1)],timeout=10)
             self.assertNotEqual(result.returncode,0,ext)
 
+    def test_detected_format_is_independent_of_filename(self):
+        import gzip
+        tar=self.tar("data.zip",[("file",b"contents","file")])
+        zipped=io.BytesIO()
+        with zipfile.ZipFile(zipped,"w") as z: z.writestr("file",b"contents")
+        folder=self.base/"folder.tar";folder.mkdir()
+        single=folder/"data.gz";single.write_bytes(gzip.compress(b"contents"))
+        wrapped=self.base/"wrapped.gz";wrapped.write_bytes(gzip.compress(zipped.getvalue()))
+        seven=Path(__file__).resolve().parent/"fixtures/lzma2.7z"
+        for path,kind in ((tar,0),(wrapped,1),(single,2),(seven,3)):
+            result=subprocess.run([str(DRIVER),"format",str(path),str(self.dest)],capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0)
+            self.assertEqual(int(result.stdout),kind)
+
     def test_malformed_zip_end_records_and_short_local_headers(self):
         import struct
         zipped=io.BytesIO()
