@@ -484,6 +484,7 @@ The library expects:
 
 - **zlib** - For gzip decompression (`-lz`)
 - **libbz2** - For bzip2 decompression (`-lbz2`)
+- **liblzma** - For xz and LZMA decompression (`-llzma`)
 - **Standard C library** - POSIX.1-2008 features
 
 ## Safety Features
@@ -492,7 +493,7 @@ The library expects:
 
 - **Hard byte limits:** Every stream has a `byte_limit` that cannot be exceeded
 - **Limit enforcement:** Limits checked before each read operation
-- **Automatic limits:** File streams get 10x file size limit (for compressed archives)
+- **Decoded limits:** Readers enforce entry counts, name lengths, and declared uncompressed sizes; filters limit decoded bytes.
 - **Substream limits:** Automatically set to entry size
 - **Filter limits:** Decompression filters enforce limits on decompressed data
 
@@ -507,7 +508,7 @@ The library expects:
 
 - Comprehensive error codes via `errno`
 - NULL pointer checks throughout
-- Graceful degradation (e.g., hardlinks fall back to file copy)
+- Forward hardlinks are resolved after their regular targets are extracted.
 - Resource cleanup on errors
 
 ### Memory Safety

@@ -471,8 +471,8 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
         size_t filled = 0;
         if (n > 0) {
             size_t magic_len = (size_t)n;
-            if (magic_len > sizeof(header)) {
-                magic_len = sizeof(header);
+            if (magic_len > sizeof(magic)) {
+                magic_len = sizeof(magic);
             }
             memcpy(header, magic, magic_len);
             filled = magic_len;
