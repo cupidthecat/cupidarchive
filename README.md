@@ -18,7 +18,7 @@ The library is designed with safety as a primary concern:
 
 ## Current Support
 
-- **Formats:** TAR (ustar + pax + GNU long name extensions), ZIP (central directory + streaming mode, ZIP64 support), 7z (single-file, LZMA/LZMA2), compressed single files (.gz, .bz2, .xz as virtual archives)
+- **Formats:** TAR (ustar, PAX, GNU long names, and GNU/PAX sparse files), ZIP (central directory + streaming mode, ZIP64 support), 7z (single-file, LZMA/LZMA2), compressed single files (.gz, .bz2, .xz as virtual archives)
 - **Compression:** gzip (zlib), bzip2 (libbz2), deflate (zlib, for ZIP), xz/lzma (liblzma)
 - **Entry Types:** Regular files, directories, symlinks, hardlinks (TAR only), files and directories (ZIP)
 - **Operations:** Reading, previewing, and **extraction**
@@ -39,7 +39,7 @@ With XZ filter support you can treat `.tar.xz` as a native archive, and `.xz` / 
 - **Hardlinks are copied** – TAR hardlink entries fall back to regular file copies because inode tracking/relink passes are not implemented.
 - **Metadata is partial** – Extraction preserves permissions and timestamps, but ownership (`uid`/`gid`) is not restored and ZIP symlinks/hardlinks are unsupported.
 - **Encrypted ZIP entries are unsupported** – The ZIP parser recognizes the encryption flag but cannot decrypt password-protected entries.
-- **XZ support depends on liblzma** – When `lzma.h` is unavailable, `arc_filter_xz()` returns `ENOSYS` and `.xz` archives cannot be read.
+- **liblzma development files are required** – The source build includes both xz and 7z readers; link applications with `-llzma`.
 - **7z support is limited** – Only single-file, single-folder 7z archives with LZMA/LZMA2 (or copy) are supported. No encryption, multi-volume, or solid multi-file archives yet.
 
 ## Limits (ArcLimits)
@@ -149,6 +149,7 @@ The filter layer wraps underlying streams to provide decompression. Filters are 
 
 - Uses zlib's `inflateInit2()` with `-MAX_WBITS` for raw deflate (no gzip wrapper)
 - Used internally by ZIP format for deflate-compressed entries
+- Input must be bounded to one compressed payload; bytes after its end marker fail validation
 - Maintains a 64KB input buffer
 - Streams decompression
 - Does NOT support seeking (returns ESPIPE)
@@ -163,7 +164,7 @@ The filter layer wraps underlying streams to provide decompression. Filters are 
 The TAR format implementation supports:
 
 **Supported TAR Variants:**
-- **ustar format** - Standard POSIX TAR with 100-byte filename limit
+- **ustar format** - Standard POSIX TAR with name and path-prefix fields
 - **pax extended headers** - For long paths (>100 chars) and large files (>8GB)
 - **Old TAR format** - Pre-ustar format (detected by absence of magic)
 
@@ -188,8 +189,8 @@ The TAR format implementation supports:
 PAX (Portable Archive Interchange) extended headers provide POSIX-compliant support for:
 
 **PAX per-file records (typeflag = 'x'):**
-- `path` - Overrides filename (supports arbitrary length)
-- `linkpath` - Overrides symlink target (supports arbitrary length)
+- `path` - Overrides filename, within the configured name limit
+- `linkpath` - Overrides the link target, within the configured name limit
 - `size` - Overrides file size (supports large files)
 - `uid`, `gid`, `mtime`, `mode` - Override metadata (common in the wild)
 - Applied to the next real entry (skipped in entry iteration)
@@ -239,7 +240,7 @@ The ZIP format implementation supports:
 
 **ZIP Features:**
 - **Central Directory parsing** - Fast listing using central directory (standard ZIP files)
-- **Streaming mode** - Falls back to local header parsing when central directory is missing
+- **Local-header recovery** - Reads complete local entries when the central directory is absent; input must be seekable
 - **ZIP64 support** - Files >4GB, archives >4GB, >65535 entries via ZIP64 EOCD + locator + extra fields
 - **Data descriptor support** - Handles ZIPs created with streaming (bit 3 set in general purpose flags)
 - **Compression methods:** Store (0) and Deflate (8)
@@ -252,7 +253,8 @@ The ZIP format implementation supports:
 - Parses ZIP64 End of Central Directory Record (signature 0x06064b50)
 - Handles ZIP64 Extended Information Extra Field (0x0001) in both central and local headers
 - Supports 64-bit file sizes, compressed sizes, and local header offsets
-- Works in both central directory and streaming modes
+- Replaces only fields marked with ZIP64 sentinels; ordinary sizes and offsets remain intact
+- Works in both central-directory and local-header recovery modes
 
 **ZIP Reader State:**
 Internals are not part of the public API (opaque `ArcReader`), but conceptually the ZIP reader tracks:
@@ -263,16 +265,19 @@ Internals are not part of the public API (opaque `ArcReader`), but conceptually 
 **Data Descriptor Support:**
 - Handles ZIPs created with streaming where sizes aren't known at header time
 - Detects data descriptors via general purpose bit flag 3 (0x0008)
-- For uncompressed entries: searches for data descriptor signature (0x08074b50) after compressed data
-- For compressed entries: decompresses until EOF, then reads data descriptor
-- Supports both signed (with signature) and unsigned data descriptor formats
-- Falls back gracefully when data descriptors can't be found
+- Stored entries in recovery mode locate descriptors by matching CRC, sizes, and the following record boundary
+- Deflated entries in recovery mode decode through the end of the raw deflate stream and count the compressed bytes consumed
+- Supports descriptors with or without a signature and with 32- or 64-bit sizes
+- Rejects missing or inconsistent descriptors instead of guessing zero-length contents
+- Enforces decoded byte limits while recovering descriptors
 
 **Key Implementation Details:**
-- Entry data is NOT read automatically - must call `arc_open_data()` or `arc_skip_data()`
-- Entry remains valid until next `arc_next()` call or explicit `arc_skip_data()`
-- Central directory mode: reads all entries from central directory first
-- Streaming mode: reads entries sequentially from local file headers
+- Use `arc_open_data()` to read an entry or `arc_skip_data()` to discard it
+- Entry data remains available until the next `arc_next()` or explicit `arc_skip_data()`
+- Central-directory mode reads entry metadata first and verifies local names, flags, methods, and sizes before opening data
+- Local-header recovery reads entries sequentially; finding a descriptor may require bounded decoding before the entry is returned
+- A present but malformed EOCD/ZIP64 record is an error. Truncated local headers also fail; they are not treated as an empty archive
+- EOCD comments may contain signature-like bytes; the reader checks the declared comment length and directory bounds before choosing a footer
 - Supports both compressed (deflate) and uncompressed (store) entries
 
 #### Archive Reader (`arc_reader.h`, `arc_reader.c`)
@@ -331,28 +336,24 @@ The extraction layer provides full archive extraction capabilities.
 
 #### Extraction Implementation Details
 
-**Directory Creation:**
-- Uses `mkdir_p_at()` (`openat()` + `mkdirat()`) to create parent directories recursively
-- Default mode: 0755
-- Handles existing directories gracefully (EEXIST)
-- Does **not** follow symlinks while traversing (`O_NOFOLLOW`)
+**Directory creation and attributes:**
+- Traverses each parent through `openat()` with `O_NOFOLLOW`, creating missing directories with `mkdirat()` and mode 0755.
+- Applies directory permissions and timestamps after extracting members, with children before their parents.
+- Uses the last archive entry's metadata when a directory path is repeated.
 
-**File Extraction:**
-- Uses 64KB buffer for copying
-- Creates files with `openat(..., O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, ...)`
-- Preserves permissions if requested
-- Sets timestamps using `futimens()` (fd-based) if requested
+**File extraction:**
+- Copies through a 64 KiB buffer into a new temporary file beside the destination.
+- Keeps zero-filled ranges sparse and sets the final logical size with `ftruncate()`.
+- Replaces the destination only after member reads and requested metadata updates succeed.
 
-**Symlink Extraction (TAR only):**
-- Removes existing file/symlink first (`unlinkat()`)
-- Creates symlink with `symlinkat()`
-- Does NOT preserve permissions (symlinks don't have separate permissions)
-- ZIP format does not support symlinks
+**Symlink extraction (TAR):**
+- Creates a temporary symlink with `symlinkat()` and renames it into place.
+- Symlink permissions are not restored. The ZIP reader does not interpret Unix symlink entries.
 
-**Hardlink Extraction (TAR only):**
-- Currently extracts as regular file (hardlink creation requires inode tracking)
-- Future enhancement: track inode mappings and create links in second pass
-- ZIP format does not support hardlinks
+**Hardlink extraction (TAR):**
+- Resolves targets inside the extraction root and creates links with `linkat()`.
+- Full-archive extraction defers forward hardlinks until their regular targets exist.
+- For single-entry extraction, the target must already exist. The ZIP reader does not interpret hardlink metadata.
 
 **Attribute Preservation:**
 - Permissions: `fchmod()` with `mode & 0777` (only user/group/other bits)
@@ -380,7 +381,7 @@ if (!reader) {
 ArcEntry entry;
 while (arc_next(reader, &entry) == 0) {
     printf("Entry: %s (size: %lu)\n", entry.path, entry.size);
-    
+
     // Optionally read entry data
     ArcStream *data = arc_open_data(reader);
     if (data) {
@@ -389,7 +390,7 @@ while (arc_next(reader, &entry) == 0) {
         // ... process data ...
         arc_stream_close(data);
     }
-    
+
     arc_entry_free(&entry);
 }
 
@@ -484,6 +485,7 @@ The library expects:
 
 - **zlib** - For gzip decompression (`-lz`)
 - **libbz2** - For bzip2 decompression (`-lbz2`)
+- **liblzma** - For xz and LZMA decompression (`-llzma`)
 - **Standard C library** - POSIX.1-2008 features
 
 ## Safety Features
@@ -492,7 +494,7 @@ The library expects:
 
 - **Hard byte limits:** Every stream has a `byte_limit` that cannot be exceeded
 - **Limit enforcement:** Limits checked before each read operation
-- **Automatic limits:** File streams get 10x file size limit (for compressed archives)
+- **Decoded limits:** Readers enforce entry counts, name lengths, and declared uncompressed sizes; filters limit decoded bytes.
 - **Substream limits:** Automatically set to entry size
 - **Filter limits:** Decompression filters enforce limits on decompressed data
 
@@ -507,25 +509,25 @@ The library expects:
 
 - Comprehensive error codes via `errno`
 - NULL pointer checks throughout
-- Graceful degradation (e.g., hardlinks fall back to file copy)
+- Forward hardlinks are resolved after their regular targets are extracted.
 - Resource cleanup on errors
 
 ### Memory Safety
 
-- All allocated memory is properly freed
+- Close streams and readers to release their state.
 - Entry strings are allocated and must be freed by caller
 - Streams clean up their internal data on close
-- No memory leaks in normal operation
+- Sanitizer regressions check covered decoding and extraction paths for leaks and invalid accesses.
 
 ## Extraction Features
 
 - **Full archive extraction:** `arc_extract_to_path()` extracts all entries
 - **Single entry extraction:** `arc_extract_entry()` extracts one entry at a time
-- **Directory creation:** Automatically creates parent directories as needed (`mkdir_p_at()` via `openat()`/`mkdirat()`)
-- **Permission preservation:** Optional preservation of file permissions and ownership
+- **Directory creation:** Creates parent directories through `openat()` and `mkdirat()`
+- **Permission preservation:** Optional preservation of file permissions; ownership is not restored
 - **Timestamp preservation:** Optional preservation of modification times
 - **Symlink support:** Creates symlinks correctly (TAR format only)
-- **Hardlink handling:** Attempts to create hardlinks, falls back to copying (TAR format only, future: proper inode tracking)
+- **Hardlink handling:** Creates TAR hardlinks and resolves forward references during full-archive extraction
 
 ## Testing
 
@@ -616,7 +618,6 @@ Paths are normalized to:
 - [ ] RAR format support (read-only)
 - [ ] Progress callbacks for extraction
 - [ ] Extraction filters (exclude patterns)
-- [ ] Proper hardlink handling (inode tracking)
 - [ ] Ownership preservation (chown support)
 - [ ] Archive creation (write support)
 - [ ] ZIP encryption support (password-protected archives)
@@ -631,3 +632,29 @@ This means:
 - If you use this library in your project, your project must also be licensed under GPL-3.0 (or a compatible license)
 
 See the LICENSE file in the parent directory for the full license text.
+
+## Building and extraction checks
+
+Run `make -j` to build all readers, including 7z and xz. Link applications with `libcupidarchive.a -lz -lbz2 -llzma`; the development headers for all three compression libraries are required. Run `make test` for stream, reader, and extraction regressions.
+
+Extraction traverses destination directories through file descriptors and rejects symlink ancestors. Regular files are written beside their destination and renamed after successful reads and metadata updates. A truncated member, a ZIP checksum mismatch, or a reader error causes extraction to fail; existing files survive failed member writes. Successful members of an archive are retained if a later member fails. Hardlinks can refer to later regular members, and directory metadata is applied after its children.
+
+Close each data stream returned by `arc_open_data` before closing its reader. On successful `arc_open_stream`, the reader owns the supplied stream; on failure the caller still owns it. Seekable raw streams reset their read budget after a successful seek; decompression filters remain forward only and retain their decoded byte budget.
+
+The single-file 7z reader accepts Copy, LZMA1, and LZMA2 data and encoded file tables, decodes UTF-16 names to UTF-8, and validates header and available data checksums. Empty files, single directories, and empty archives are supported. Metadata is bounded before decoding; LZMA decoder memory is capped at 128 MiB. Multi-file, multi-folder, multi-volume, and encrypted 7z archives remain unsupported.
+
+Compressed TAR readers finish the compression stream before reporting archive completion, so missing trailers and checksum failures are reported even after the TAR end marker. ZIP and 7z inside gzip, bzip2, or xz are decoded to an anonymous temporary file for random access, within the configured decoded byte limit. Ordinary compressed files and TAR archives remain streamed.
+
+Gzip, bzip2, and xz filters decode concatenated members as one byte stream and enforce the decoded limit across all members. Damaged later members and trailing non-member data fail instead of returning a successful prefix. The gzip/bzip2 readers reset their decoder at each member boundary, as required by the [zlib manual](https://www.zlib.net/manual.html) and [bzip2 manual](https://sourceware.org/bzip2/manual/manual.html).
+
+Standalone compressed entries report `size = 0` for unknown length. A gzip trailer contains only one member's size modulo 2^32, and an xz footer describes its own stream; neither is a reliable total for concatenated input. Read the entry data until EOF to obtain the full contents. Advancing past or skipping a compressed entry drains the filter and reports decoding failures.
+
+Record reads retry short underlying reads. File-path readers accept regular files and reject FIFOs without waiting for a writer. XZ streams without a content checksum are accepted, while checksums present in the stream are verified. XZ decoder memory is capped at 128 MiB.
+
+GNU sparse files are reconstructed from their extent maps, including old GNU extension headers and PAX sparse versions 0.0, 0.1, and 1.0. Extraction retains holes, and following members use the stored-data boundaries rather than the logical sparse size. The implementation follows the [GNU sparse-format descriptions](https://www.gnu.org/software/tar/manual/html_section/Sparse-Formats.html).
+
+TAR metadata parsing validates record lengths, numeric overflow, sparse ranges, and stored-byte totals before returning a member. PAX size overrides control both data reads and alignment. GNU long names retain literal newlines. `max_extra` bounds per-member extension metadata; `max_uncompressed_bytes` also bounds logical sparse sizes. Sparse fixture tests use GNU tar as an independent producer and Python's TAR reader to check the expected contents.
+
+The ZIP metadata and descriptor layouts follow the [PKWARE ZIP specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT). Regression coverage includes every conditional ZIP64 size/offset combination, ZIP64 end records, sparse input with a local-header offset beyond 4 GiB, local-header recovery, unsigned descriptors, descriptor-like payload bytes, and malformed metadata.
+
+Call `arc_format(reader)` to query the decoded container type. A ZIP inside gzip is reported as `ARC_FORMAT_ZIP`; a standalone compressed file is `ARC_FORMAT_COMPRESSED`. The query uses the detected data format rather than filename suffixes, and returns `ARC_FORMAT_UNKNOWN` for a null reader.

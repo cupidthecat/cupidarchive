@@ -36,8 +36,8 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
 
     if (!data->initialized) {
         data->zs = (lzma_stream)LZMA_STREAM_INIT;
-        if (lzma_stream_decoder(&data->zs, UINT64_MAX, LZMA_CONCATENATED | LZMA_TELL_NO_CHECK) != LZMA_OK) {
-            return -1;
+        if (lzma_stream_decoder(&data->zs, 128ULL * 1024ULL * 1024ULL, LZMA_CONCATENATED) != LZMA_OK) {
+            errno = ENOMEM; return -1;
         }
         data->initialized = true;
     }
@@ -49,7 +49,13 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
     if (stream->byte_limit > 0) {
         int64_t remaining = stream->byte_limit - stream->bytes_read;
         if (remaining <= 0) {
-            return 0;
+            uint8_t extra;
+            int64_t limit = stream->byte_limit;
+            stream->byte_limit = 0;
+            ssize_t result = xz_read(stream, &extra, 1);
+            stream->byte_limit = limit;
+            if (result > 0) { errno = EOVERFLOW; return -1; }
+            return result;
         }
         if ((int64_t)n > remaining) {
             n = (size_t)remaining;
@@ -67,7 +73,7 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
             }
             if (in_read == 0) {
                 size_t output_before = n - data->zs.avail_out;
-                for (;;) {
+                while (data->zs.avail_out > 0) {
                     lzma_ret ret = lzma_code(&data->zs, LZMA_FINISH);
                     if (ret == LZMA_STREAM_END) {
                         data->eof = true;
@@ -83,7 +89,7 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
                         continue;
                     }
                     if (ret != LZMA_OK) {
-                        return -1;
+                        errno = ret == LZMA_MEM_ERROR ? ENOMEM : ret == LZMA_MEMLIMIT_ERROR ? EOVERFLOW : EINVAL; return -1;
                     }
                     size_t output_after = n - data->zs.avail_out;
                     output_before = output_after;
@@ -108,7 +114,7 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
             continue;
         }
         if (ret != LZMA_OK) {
-            return -1;
+            errno = ret == LZMA_MEM_ERROR ? ENOMEM : ret == LZMA_MEMLIMIT_ERROR ? EOVERFLOW : EINVAL; return -1;
         }
     }
 
@@ -126,9 +132,7 @@ static int xz_seek(ArcStream *stream, int64_t off, int whence) {
 }
 
 static int64_t xz_tell(ArcStream *stream) {
-    (void)stream;
-    errno = ESPIPE;
-    return -1;
+    return stream->bytes_read;
 }
 
 static void xz_close(ArcStream *stream) {

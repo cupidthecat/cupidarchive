@@ -20,7 +20,7 @@
  */
 typedef struct ArcEntry {
     char     *path;        // Normalized path (allocated, caller must free)
-    uint64_t  size;        // File size in bytes
+    uint64_t  size;        // File size in bytes; 0 also denotes unknown size for streamed compressed files
     uint32_t  mode;        // File mode/permissions
     uint64_t  mtime;       // Modification time (Unix timestamp)
     uint8_t   type;        // Entry type (ARC_ENTRY_*)
@@ -34,6 +34,18 @@ typedef struct ArcEntry {
  */
 typedef struct ArcReader ArcReader;
 
+/** Format of the decoded container, independent of its filename or compression wrapper. */
+typedef enum ArcFormat {
+    ARC_FORMAT_UNKNOWN = -1,
+    ARC_FORMAT_TAR = 0,
+    ARC_FORMAT_ZIP = 1,
+    ARC_FORMAT_COMPRESSED = 2,
+    ARC_FORMAT_7Z = 3
+} ArcFormat;
+
+/** Returns ARC_FORMAT_UNKNOWN for NULL; standalone compressed files use ARC_FORMAT_COMPRESSED. */
+ArcFormat arc_format(const ArcReader *reader);
+
 /**
  * Safety/resource limits for parsing and extraction.
  * All limits are "best effort" and enforced where possible.
@@ -42,7 +54,7 @@ typedef struct ArcReader ArcReader;
 typedef struct ArcLimits {
     uint64_t max_entries;            // Max number of entries in an archive (ZIP central dir, etc.)
     uint64_t max_name;               // Max entry name/path bytes
-    uint64_t max_extra;              // Max extra field bytes
+    uint64_t max_extra;              // Max extra/extension metadata bytes (ZIP fields, TAR member metadata)
     uint64_t max_uncompressed_bytes; // Max uncompressed bytes allowed (zip bombs)
     uint64_t max_nested_depth;       // Max path depth (components) during extraction
 } ArcLimits;

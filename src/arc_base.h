@@ -2,6 +2,7 @@
 #define ARC_BASE_H
 
 #include "arc_stream.h"
+#include "arc_reader.h"
 
 typedef struct ArcLimits ArcLimits;
 
@@ -14,8 +15,18 @@ typedef struct ArcReaderBase {
     int format;              // Archive format identifier (ARC_FORMAT_*)
     ArcStream *stream;        // The stream the format reads from
     ArcStream *owned_stream;  // For closing (optional)
+    ArcLimits limits_storage;
+    uint64_t entries_seen;
+    uint64_t declared_bytes;
+    int terminal_error;
+    bool drain_on_eof;
     const ArcLimits *limits;  // Safety/resource limits (may be NULL => defaults)
 } ArcReaderBase;
+
+static inline void arc_base_set_limits(ArcReaderBase *base, const ArcLimits *limits) {
+    base->limits_storage = limits ? *limits : *arc_default_limits();
+    base->limits = &base->limits_storage;
+}
 
 /**
  * Safe accessor to get the format from any reader.

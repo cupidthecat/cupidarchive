@@ -68,6 +68,9 @@ struct ArcStream {
  */
 ssize_t arc_stream_read(ArcStream *stream, void *buf, size_t n);
 
+/* Fill a record, stopping only on EOF or error; short underlying reads are retried. */
+ssize_t arc_stream_read_fully(ArcStream *stream, void *buf, size_t n);
+
 /**
  * Seek in a stream (if supported).
  * 
@@ -121,6 +124,11 @@ ArcStream *arc_stream_from_memory(const void *data, size_t size, int64_t byte_li
  * @return New substream, or NULL on error
  */
 ArcStream *arc_stream_substream(ArcStream *parent, int64_t offset, int64_t length);
+
+/* Borrow a stream for the lifetime of its owner; closing the view keeps the owner alive. */
+ArcStream *arc_stream_view(ArcStream *parent);
+/* Own both streams on success; callers retain them on allocation failure. */
+ArcStream *arc_stream_with_parent(ArcStream *stream, ArcStream *parent);
 
 #endif // ARC_STREAM_H
 
