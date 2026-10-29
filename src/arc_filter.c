@@ -61,7 +61,7 @@ static ssize_t gzip_read(ArcStream *stream, void *buf, size_t n) {
     if (stream->byte_limit > 0) {
         int64_t remaining = stream->byte_limit - stream->bytes_read;
         if (remaining <= 0) {
-            return 0; // EOF (limit reached)
+            errno = EOVERFLOW; return -1;
         }
         if ((int64_t)n > remaining) {
             n = (size_t)remaining;
@@ -233,7 +233,7 @@ static ssize_t bzip2_read(ArcStream *stream, void *buf, size_t n) {
     if (stream->byte_limit > 0) {
         int64_t remaining = stream->byte_limit - stream->bytes_read;
         if (remaining <= 0) {
-            return 0; // EOF (limit reached)
+            errno = EOVERFLOW; return -1;
         }
         if ((int64_t)n > remaining) {
             n = (size_t)remaining;
@@ -251,15 +251,10 @@ static ssize_t bzip2_read(ArcStream *stream, void *buf, size_t n) {
                 return -1;
             }
             if (in_read == 0) {
-                // No more input, finish decompression
+                unsigned before = data->bzs.avail_out;
                 int ret = BZ2_bzDecompress(&data->bzs);
-                if (ret == BZ_STREAM_END) {
-                    data->eof = true;
-                    break;
-                }
-                if (ret != BZ_OK) {
-                    return -1;
-                }
+                if (ret == BZ_STREAM_END) { data->eof = true; break; }
+                if (ret != BZ_OK || before == data->bzs.avail_out) { errno = EINVAL; return -1; }
                 break;
             }
             data->bzs.next_in = (char *)data->in_buf;
@@ -383,7 +378,7 @@ static ssize_t deflate_read(ArcStream *stream, void *buf, size_t n) {
     if (stream->byte_limit > 0) {
         int64_t remaining = stream->byte_limit - stream->bytes_read;
         if (remaining <= 0) {
-            return 0; // EOF (limit reached)
+            errno = EOVERFLOW; return -1;
         }
         if ((int64_t)n > remaining) {
             n = (size_t)remaining;

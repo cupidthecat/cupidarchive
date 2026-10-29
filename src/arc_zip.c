@@ -115,6 +115,7 @@ typedef struct ZipReader {
     bool entry_valid;
     int64_t entry_data_offset;
     int64_t entry_data_remaining;
+    uint32_t entry_crc32;
     uint64_t entry_uncompressed_size;  // Store separately since current_entry is cleared
     uint16_t entry_compression_method;
     uint16_t entry_flags;
@@ -857,6 +858,7 @@ static int zip_read_entry(ZipReader *reader) {
         memmove(path, path + 1, strlen(path));
     }
     
+    reader->entry_crc32 = cd_entry->crc32;
     reader->current_entry.size = cd_entry->uncompressed_size;
     reader->current_entry.mode = zip_entry_mode(cd_entry);
     reader->current_entry.mtime = dos_datetime_to_unix(cd_entry->mod_date, cd_entry->mod_time);
@@ -882,7 +884,8 @@ static int zip_read_entry(ZipReader *reader) {
         reader->entry_data_offset = cd_entry->local_header_offset;
         reader->entry_data_remaining = cd_entry->compressed_size;
         reader->entry_uncompressed_size = cd_entry->uncompressed_size;
-        reader->current_entry.size = cd_entry->uncompressed_size;
+        reader->entry_crc32 = cd_entry->crc32;
+    reader->current_entry.size = cd_entry->uncompressed_size;
     }
     reader->entry_compression_method = cd_entry->compression_method;
     reader->entry_flags = cd_entry->flags;
@@ -1071,7 +1074,8 @@ static int zip_read_entry_streaming(ZipReader *reader) {
         reader->entry_data_offset = header_pos + 30 + cd_entry->filename_length + cd_entry->extra_field_length;
         reader->entry_data_remaining = (int64_t)cd_entry->zip64_compressed_size;
     } else {
-        reader->current_entry.size = cd_entry->uncompressed_size;
+        reader->entry_crc32 = cd_entry->crc32;
+    reader->current_entry.size = cd_entry->uncompressed_size;
         reader->entry_uncompressed_size = cd_entry->uncompressed_size;
         reader->entry_data_offset = header_pos + 30 + cd_entry->filename_length + cd_entry->extra_field_length;
         reader->entry_data_remaining = (int64_t)cd_entry->compressed_size;
@@ -1120,12 +1124,49 @@ int arc_zip_next(ArcReader *reader, ArcEntry *entry) {
     return ret;
 }
 
+typedef struct ZipCheckedData {
+    ArcStream *data;
+    uint64_t size, expected_size;
+    uint32_t checksum, expected_checksum;
+    bool failed;
+} ZipCheckedData;
+static ssize_t checked_zip_read(ArcStream *stream, void *buffer, size_t size) {
+    ZipCheckedData *data = stream->user_data;
+    if (data->failed) { errno = EIO; return -1; }
+    if (size > UINT_MAX) size = UINT_MAX;
+    ssize_t n = arc_stream_read(data->data, buffer, size);
+    if (n > 0) {
+        if ((uint64_t)n > data->expected_size - data->size) { data->failed = true; errno = EIO; return -1; }
+        data->size += (uint64_t)n;
+        data->checksum = crc32(data->checksum, buffer, (uInt)n);
+    } else if (n == 0 && (data->size != data->expected_size || data->checksum != data->expected_checksum)) {
+        data->failed = true; errno = EIO; return -1;
+    }
+    return n;
+}
+static int64_t checked_zip_tell(ArcStream *stream) {
+    return (int64_t)((ZipCheckedData *)stream->user_data)->size;
+}
+static void checked_zip_close(ArcStream *stream) {
+    ZipCheckedData *data = stream->user_data;
+    arc_stream_close(data->data); free(data); free(stream);
+}
+static ArcStream *checked_zip(ArcStream *source, uint64_t expected_size, uint32_t expected_crc) {
+    static const struct ArcStreamVtable table = {checked_zip_read, NULL, checked_zip_tell, checked_zip_close};
+    ZipCheckedData *data = calloc(1, sizeof(*data));
+    ArcStream *stream = calloc(1, sizeof(*stream));
+    if (!data || !stream) { free(data); free(stream); arc_stream_close(source); return NULL; }
+    data->data = source; data->expected_size = expected_size; data->expected_checksum = expected_crc;
+    stream->vtable = &table; stream->user_data = data;
+    return stream;
+}
+
 ArcStream *arc_zip_open_data(ArcReader *reader) {
     if (!reader) {
         return NULL;
     }
     ZipReader *zip = (ZipReader *)reader;
-    if (!zip->entry_valid || zip->entry_data_remaining == 0) {
+    if (!zip->entry_valid) {
         return NULL;
     }
     
@@ -1169,7 +1210,7 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
     // Wrap with decompression filter if needed
     if (zip->entry_compression_method == ZIP_METHOD_DEFLATE) {
         // ZIP uses raw deflate (not gzip-wrapped)
-        int64_t out_limit = zip->entry_uncompressed_size;
+        int64_t out_limit = zip->entry_uncompressed_size < INT64_MAX ? (int64_t)zip->entry_uncompressed_size + 1 : INT64_MAX;
         if (zip->base.limits && zip->base.limits->max_uncompressed_bytes > 0) {
             if (out_limit <= 0 || (uint64_t)out_limit > zip->base.limits->max_uncompressed_bytes) {
                 out_limit = (int64_t)zip->base.limits->max_uncompressed_bytes;
@@ -1177,7 +1218,9 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
         }
         ArcStream *decompressed = arc_filter_deflate(data_stream, out_limit);
         if (decompressed) {
-            return decompressed;
+            ArcStream *owned = arc_stream_with_parent(decompressed, data_stream);
+            if (!owned) { arc_stream_close(decompressed); arc_stream_close(data_stream); return NULL; }
+            return checked_zip(owned, zip->entry_uncompressed_size, zip->entry_crc32);
         }
         // Fall through to return compressed stream if filter fails
         arc_stream_close(data_stream);
@@ -1188,7 +1231,7 @@ ArcStream *arc_zip_open_data(ArcReader *reader) {
         return NULL;
     }
     
-    return data_stream;
+    return checked_zip(data_stream, zip->entry_uncompressed_size, zip->entry_crc32);
 }
 
 int arc_zip_skip_data(ArcReader *reader) {
@@ -1256,7 +1299,7 @@ ArcReader *arc_zip_open_ex(ArcStream *stream, const ArcLimits *limits) {
     
     zip->base.format = ARC_FORMAT_ZIP;
     zip->base.stream = stream;
-    zip->base.limits = limits;
+    arc_base_set_limits(&zip->base, limits);
     zip->entry_valid = false;
     zip->eof = false;
     zip->current_entry_index = 0;

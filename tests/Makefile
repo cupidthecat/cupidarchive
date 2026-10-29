@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -std=c11
 INCLUDES = -I../src -I..
-LIBS = -lz -lbz2
+LIBS = -lz -lbz2 -llzma
 ASAN_CFLAGS = -fsanitize=address -fno-omit-frame-pointer -g
 ASAN_LIBS = -fsanitize=address
 
@@ -21,15 +21,15 @@ $(LIBRARY):
 	@$(MAKE) -C $(LIBDIR) all
 
 # Test executables
-test_arc_stream: test_arc_stream.c test_runner.h
+test_arc_stream: test_arc_stream.c test_runner.h $(LIBRARY)
 	@$(MAKE) -C $(LIBDIR) all
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_arc_stream.c -L$(LIBDIR) -lcupidarchive $(LIBS)
 
-test_arc_reader: test_arc_reader.c test_runner.h
+test_arc_reader: test_arc_reader.c test_runner.h $(LIBRARY)
 	@$(MAKE) -C $(LIBDIR) all
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_arc_reader.c -L$(LIBDIR) -lcupidarchive $(LIBS)
 
-test_arc_extract: test_arc_extract.c test_runner.h
+test_arc_extract: test_arc_extract.c test_runner.h $(LIBRARY)
 	@$(MAKE) -C $(LIBDIR) all
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ test_arc_extract.c -L$(LIBDIR) -lcupidarchive $(LIBS)
 

@@ -380,7 +380,7 @@ if (!reader) {
 ArcEntry entry;
 while (arc_next(reader, &entry) == 0) {
     printf("Entry: %s (size: %lu)\n", entry.path, entry.size);
-    
+
     // Optionally read entry data
     ArcStream *data = arc_open_data(reader);
     if (data) {
@@ -389,7 +389,7 @@ while (arc_next(reader, &entry) == 0) {
         // ... process data ...
         arc_stream_close(data);
     }
-    
+
     arc_entry_free(&entry);
 }
 
@@ -631,3 +631,11 @@ This means:
 - If you use this library in your project, your project must also be licensed under GPL-3.0 (or a compatible license)
 
 See the LICENSE file in the parent directory for the full license text.
+
+## Building and extraction checks
+
+Run `make -j` to build all readers, including 7z and xz. Link applications with `libcupidarchive.a -lz -lbz2 -llzma`; the development headers for all three compression libraries are required. Run `make test` for stream, reader, and extraction regressions.
+
+Extraction traverses destination directories through file descriptors and rejects symlink ancestors. Regular files are written beside their destination and renamed after successful reads and metadata updates. A truncated member, a ZIP checksum mismatch, or a reader error causes extraction to fail; existing files survive failed member writes. Successful members of an archive are retained if a later member fails. Hardlinks can refer to later regular members, and directory metadata is applied after its children.
+
+Close each data stream returned by `arc_open_data` before closing its reader. On successful `arc_open_stream`, the reader owns the supplied stream; on failure the caller still owns it. Seekable raw streams reset their read budget after a successful seek; decompression filters remain forward only and retain their decoded byte budget.

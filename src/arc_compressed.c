@@ -333,7 +333,7 @@ ArcStream *arc_compressed_open_data(ArcReader *reader) {
     // Return the decompressed stream directly
     // Note: We don't create a substream because we don't know the size
     // The stream will naturally end when decompression is complete
-    return comp->decompressed;
+    return arc_stream_view(comp->decompressed);
 }
 
 int arc_compressed_skip_data(ArcReader *reader) {

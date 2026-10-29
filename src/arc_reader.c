@@ -94,11 +94,12 @@ static const ArcLimits *normalize_limits(const ArcLimits *in) {
     const ArcLimits *d = arc_default_limits();
     if (!in) return d;
     // Treat 0 as "use default" per-field
-    static ArcLimits merged;
+    static _Thread_local ArcLimits merged;
     merged.max_entries = in->max_entries ? in->max_entries : d->max_entries;
     merged.max_name = in->max_name ? in->max_name : d->max_name;
     merged.max_extra = in->max_extra ? in->max_extra : d->max_extra;
     merged.max_uncompressed_bytes = in->max_uncompressed_bytes ? in->max_uncompressed_bytes : d->max_uncompressed_bytes;
+    if (merged.max_uncompressed_bytes > INT64_MAX) merged.max_uncompressed_bytes = INT64_MAX;
     merged.max_nested_depth = in->max_nested_depth ? in->max_nested_depth : d->max_nested_depth;
     return &merged;
 }
@@ -116,18 +117,32 @@ int arc_next(ArcReader *reader, ArcEntry *entry) {
     }
     // Check format field using safe accessor
     int format = arc_reader_format(reader);
+    int result;
     switch (format) {
         case ARC_FORMAT_TAR:
-            return arc_tar_next(reader, entry);
+            result = arc_tar_next(reader, entry); break;
         case ARC_FORMAT_ZIP:
-            return arc_zip_next(reader, entry);
+            result = arc_zip_next(reader, entry); break;
         case ARC_FORMAT_COMPRESSED:
-            return arc_compressed_next(reader, entry);
+            result = arc_compressed_next(reader, entry); break;
         case ARC_FORMAT_7Z:
-            return arc_7z_next(reader, entry);
+            result = arc_7z_next(reader, entry); break;
         default:
             return -1;
     }
+    if (result == 0) {
+        ArcReaderBase *base = (ArcReaderBase *)reader;
+        const ArcLimits *lim = base->limits ? base->limits : arc_default_limits();
+        if (++base->entries_seen > lim->max_entries || !entry->path ||
+            strlen(entry->path) > lim->max_name || entry->size > lim->max_uncompressed_bytes ||
+            base->declared_bytes > lim->max_uncompressed_bytes - entry->size) {
+            arc_entry_free(entry);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        base->declared_bytes += entry->size;
+    }
+    return result;
 }
 
 void arc_entry_free(ArcEntry *entry) {
@@ -225,10 +240,9 @@ ArcReader *arc_open_path_ex(const char *path, const ArcLimits *limits_in) {
     }
     
     // Create stream with reasonable limit (cap by max_uncompressed_bytes to mitigate zip bombs)
-    int64_t limit = st.st_size * 10;
-    if (limits && limits->max_uncompressed_bytes > 0 && (uint64_t)limit > limits->max_uncompressed_bytes) {
-        limit = (int64_t)limits->max_uncompressed_bytes;
-    }
+    // Resource limits apply to decoded bytes and entry metadata, not the
+    // number of raw bytes reread during archive detection and random access.
+    int64_t limit = 0;
     ArcStream *stream = arc_stream_from_fd(fd, limit);
     if (!stream) {
         close(fd);
@@ -240,6 +254,7 @@ ArcReader *arc_open_path_ex(const char *path, const ArcLimits *limits_in) {
     int compression_type = -1;
     int format = detect_format(stream, &decompressed, &compression_type, path);
     if (format < 0) {
+        arc_stream_close(decompressed);
         arc_stream_close(stream);
         return NULL;
     }
@@ -310,22 +325,27 @@ ArcReader *arc_open_stream(ArcStream *stream) {
 }
 
 ArcReader *arc_open_stream_ex(ArcStream *stream, const ArcLimits *limits_in) {
-    if (!stream) {
-        return NULL;
-    }
+    if (!stream) { errno = EINVAL; return NULL; }
     const ArcLimits *limits = normalize_limits(limits_in);
-    
-    // Detect format
     ArcStream *decompressed = NULL;
     int compression_type = -1;
     int format = detect_format(stream, &decompressed, &compression_type, NULL);
-    if (format < 0) {
-        return NULL;
+    if (format < 0) { arc_stream_close(decompressed); return NULL; }
+    if (compression_type >= 0) {
+        arc_stream_close(decompressed);
+        decompressed = NULL;
+        if (format != ARC_FORMAT_TAR && format != ARC_FORMAT_COMPRESSED) { errno = ENOSYS; return NULL; }
+        if (arc_stream_seek(stream, 0, SEEK_SET) < 0) return NULL;
+        if (compression_type == ARC_COMPRESSED_GZIP) decompressed = arc_filter_gzip(stream, (int64_t)limits->max_uncompressed_bytes);
+        else if (compression_type == ARC_COMPRESSED_BZIP2) decompressed = arc_filter_bzip2(stream, (int64_t)limits->max_uncompressed_bytes);
+        else if (compression_type == ARC_COMPRESSED_XZ) decompressed = arc_filter_xz(stream, (int64_t)limits->max_uncompressed_bytes);
+        if (!decompressed) return NULL;
     }
-    
-    ArcStream *final_stream = decompressed ? decompressed : stream;
-    ArcStream *original_stream_for_compressed = (format == ARC_FORMAT_COMPRESSED) ? stream : NULL;
-    return create_reader(final_stream, format, NULL, compression_type, original_stream_for_compressed, limits);
+    ArcReader *reader = create_reader(decompressed ? decompressed : stream, format, NULL,
+                                      compression_type, format == ARC_FORMAT_COMPRESSED ? stream : NULL, limits);
+    if (!reader) { arc_stream_close(decompressed); return NULL; }
+    ((ArcReaderBase *)reader)->owned_stream = decompressed ? stream : NULL;
+    return reader;
 }
 
 // Detect archive format and compression
@@ -469,15 +489,13 @@ static int detect_format(ArcStream *stream, ArcStream **decompressed, int *compr
     }
     if (n == sizeof(header)) {
         // Reject all-zero blocks (end of archive marker, not a valid header)
-        if (is_tar_zero_block(header)) {
-            // Not a TAR file
-        } else {
+        if (true) {
             // Check for ustar magic (at offset 257) OR valid TAR checksum
             bool has_ustar_magic = (memcmp(header + 257, "ustar", 5) == 0) ||
                                     (memcmp(header + 257, "USTAR", 5) == 0);
             bool has_valid_checksum = verify_tar_checksum(header);
             
-            if (has_ustar_magic || has_valid_checksum) {
+            if (is_tar_zero_block(header) || has_ustar_magic || has_valid_checksum) {
                 // For filter streams, we can't seek back, but that's OK
                 // We'll create a fresh filter for the reader starting from position 0
                 // For regular streams, reset to beginning
@@ -530,13 +548,13 @@ static ArcReader *create_reader(ArcStream *stream, int format, const char *path,
         case ARC_FORMAT_TAR:
         {
             ArcReader *r = arc_tar_open(stream);
-            if (r) ((ArcReaderBase *)r)->limits = limits;
+            if (r) arc_base_set_limits((ArcReaderBase *)r, limits);
             return r;
         }
         case ARC_FORMAT_ZIP:
         {
             ArcReader *r = arc_zip_open_ex(stream, limits);
-            if (r) ((ArcReaderBase *)r)->limits = limits;
+            if (r) arc_base_set_limits((ArcReaderBase *)r, limits);
             return r;
         }
         case ARC_FORMAT_COMPRESSED:
@@ -547,13 +565,13 @@ static ArcReader *create_reader(ArcStream *stream, int format, const char *path,
                 arc_compressed_set_original_stream(reader, original_stream);
             }
             if (reader) {
-                ((ArcReaderBase *)reader)->limits = limits;
+                arc_base_set_limits((ArcReaderBase *)reader, limits);
             }
             return reader;
         case ARC_FORMAT_7Z:
         {
             ArcReader *r = arc_7z_open_ex(stream, limits);
-            if (r) ((ArcReaderBase *)r)->limits = limits;
+            if (r) arc_base_set_limits((ArcReaderBase *)r, limits);
             return r;
         }
         default:

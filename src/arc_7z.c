@@ -188,7 +188,7 @@ static int read_byte(const uint8_t *buf, size_t size, size_t *pos, uint8_t *out)
 }
 
 static int read_bytes(const uint8_t *buf, size_t size, size_t *pos, void *out, size_t n) {
-    if (*pos + n > size) {
+    if (*pos > size || n > size - *pos) {
         return -1;
     }
     memcpy(out, buf + *pos, n);
@@ -561,7 +561,7 @@ static int decode_header_if_needed(const uint8_t *buf, size_t size, const ArcLim
         return -1;
     }
 
-    if (folder_out->pack_pos + folder_out->pack_size > size) {
+    if (folder_out->pack_pos > size || folder_out->pack_size > size - folder_out->pack_pos) {
         return -1;
     }
 
@@ -821,6 +821,7 @@ ArcReader *arc_7z_open_ex(ArcStream *stream, const ArcLimits *limits) {
     uint64_t next_header_size = read_le64_buf(header_bytes + 14);
 
     int64_t base_offset = 32; // Signature header size
+    if (next_header_offset > INT64_MAX - base_offset) { errno = EOVERFLOW; return NULL; }
     int64_t header_pos = base_offset + (int64_t)next_header_offset;
     if (arc_stream_seek(stream, header_pos, SEEK_SET) < 0) {
         return NULL;
@@ -862,7 +863,10 @@ ArcReader *arc_7z_open_ex(ArcStream *stream, const ArcLimits *limits) {
     }
     free_folder_info(&folder);
 
-    if (num_files != 1) {
+    if (num_files != 1 || main_folder.pack_pos > INT64_MAX - 32 ||
+        main_folder.pack_size > INT64_MAX - 32 - main_folder.pack_pos ||
+        main_folder.unpack_size > INT64_MAX) {
+        free(name);
         free_folder_info(&main_folder);
         if (decoded != header_buf) {
             free(decoded);
@@ -874,6 +878,7 @@ ArcReader *arc_7z_open_ex(ArcStream *stream, const ArcLimits *limits) {
 
     SevenZReader *reader = calloc(1, sizeof(*reader));
     if (!reader) {
+        free(name);
         free_folder_info(&main_folder);
         if (decoded != header_buf) {
             free(decoded);
@@ -884,7 +889,7 @@ ArcReader *arc_7z_open_ex(ArcStream *stream, const ArcLimits *limits) {
 
     reader->base.format = 3; // ARC_FORMAT_7Z
     reader->base.stream = stream;
-    reader->base.limits = limits;
+    arc_base_set_limits(&reader->base, limits);
     reader->entry_valid = true;
     reader->entry_returned = false;
     reader->data_offset = base_offset + (int64_t)main_folder.pack_pos;
@@ -969,7 +974,9 @@ ArcStream *arc_7z_open_data(ArcReader *reader) {
         arc_stream_close(packed);
         return NULL;
     }
-    return decompressed;
+    ArcStream *owned = arc_stream_with_parent(decompressed, packed);
+    if (!owned) { arc_stream_close(decompressed); arc_stream_close(packed); }
+    return owned;
 }
 
 int arc_7z_skip_data(ArcReader *reader) {

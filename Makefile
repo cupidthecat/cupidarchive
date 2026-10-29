@@ -11,14 +11,14 @@ OBJDIR = obj
 LIBDIR = .
 
 # Source files
-SOURCES = $(SRCDIR)/arc_stream.c $(SRCDIR)/arc_filter.c $(SRCDIR)/arc_tar.c $(SRCDIR)/arc_zip.c $(SRCDIR)/arc_compressed.c $(SRCDIR)/arc_reader.c $(SRCDIR)/arc_extract.c
-OBJECTS = $(OBJDIR)/arc_stream.o $(OBJDIR)/arc_filter.o $(OBJDIR)/arc_tar.o $(OBJDIR)/arc_zip.o $(OBJDIR)/arc_compressed.o $(OBJDIR)/arc_reader.o $(OBJDIR)/arc_extract.o
+SOURCES = $(wildcard $(SRCDIR)/*.c)
+OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
 
 # Library
 LIBRARY = libcupidarchive.a
 
 # External libraries
-LIBS = -lz -lbz2
+LIBS = -lz -lbz2 -llzma
 
 # Default target
 all: $(LIBRARY)
@@ -28,26 +28,30 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 # Build static library
-$(LIBRARY): $(OBJDIR) $(OBJECTS)
+$(LIBRARY): $(OBJECTS)
 	$(AR) $(ARFLAGS) $(LIBDIR)/$(LIBRARY) $(OBJECTS)
 	@echo "Built $(LIBRARY)"
 
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 # Test program
 test-extract: $(LIBRARY) tests/test_extract.c
-	$(CC) $(CFLAGS) -I. -o test-extract tests/test_extract.c -L. -lcupidarchive -lz -lbz2
+	$(CC) $(CFLAGS) -I. -o test-extract tests/test_extract.c -L. -lcupidarchive $(LIBS)
 	@echo "Built test-extract"
 
 # Test target
-test:
+tests/archive_driver: tests/archive_driver.c $(LIBRARY)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. $< $(LIBRARY) $(LDFLAGS) $(LIBS) -o $@
+
+test: $(LIBRARY) tests/archive_driver
+	python3 tests/test_regressions.py
 	$(MAKE) -C tests test
 
 # Clean
 clean:
-	rm -rf $(OBJDIR) $(LIBRARY) test-extract
+	rm -rf $(OBJDIR) $(LIBRARY) test-extract tests/archive_driver
 	$(MAKE) -C tests clean
 
 # Install (optional)
@@ -56,3 +60,5 @@ install: $(LIBRARY)
 
 .PHONY: all clean install test-extract test
 
+
+-include $(OBJECTS:.o=.d)

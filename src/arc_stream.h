@@ -122,5 +122,10 @@ ArcStream *arc_stream_from_memory(const void *data, size_t size, int64_t byte_li
  */
 ArcStream *arc_stream_substream(ArcStream *parent, int64_t offset, int64_t length);
 
+/* Borrow a stream for the lifetime of its owner; closing the view keeps the owner alive. */
+ArcStream *arc_stream_view(ArcStream *parent);
+/* Own both streams on success; callers retain them on allocation failure. */
+ArcStream *arc_stream_with_parent(ArcStream *stream, ArcStream *parent);
+
 #endif // ARC_STREAM_H
 

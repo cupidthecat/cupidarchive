@@ -1,9 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
 #include "arc_stream.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <stdint.h>
+#include <limits.h>
 
 // Forward declarations for implementations
 static ssize_t fd_read(ArcStream *stream, void *buf, size_t n);
@@ -93,9 +96,7 @@ static int fd_seek(ArcStream *stream, int64_t off, int whence) {
     data->pos = result;
     // When seeking to the beginning, reset bytes_read to allow reading from start
     // This is important when recreating filters after format detection
-    if (whence == SEEK_SET && off == 0) {
-        stream->bytes_read = 0;
-    }
+    stream->bytes_read = 0;
     return 0;
 }
 
@@ -153,29 +154,20 @@ static ssize_t mem_read(ArcStream *stream, void *buf, size_t n) {
 
 static int mem_seek(ArcStream *stream, int64_t off, int whence) {
     struct MemStreamData *data = (struct MemStreamData *)stream->user_data;
-    size_t new_pos;
-    
+    int64_t base;
+    if (data->size > INT64_MAX) { errno = EOVERFLOW; return -1; }
     switch (whence) {
-        case SEEK_SET:
-            new_pos = (size_t)off;
-            break;
-        case SEEK_CUR:
-            new_pos = data->pos + (size_t)off;
-            break;
-        case SEEK_END:
-            new_pos = data->size + (size_t)off;
-            break;
-        default:
-            errno = EINVAL;
-            return -1;
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = (int64_t)data->pos; break;
+        case SEEK_END: base = (int64_t)data->size; break;
+        default: errno = EINVAL; return -1;
     }
-    
-    if (new_pos > data->size) {
-        errno = EINVAL;
-        return -1;
+    if ((off < 0 && off < -base) || (off >= 0 && (uint64_t)off > data->size - (size_t)base)) {
+        errno = EINVAL; return -1;
     }
-    
+    size_t new_pos = (size_t)(base + off);
     data->pos = new_pos;
+    stream->bytes_read = 0;
     return 0;
 }
 
@@ -223,7 +215,8 @@ static ssize_t substream_read(ArcStream *stream, void *buf, size_t n) {
     }
     
     // Seek parent to correct position
-    if (arc_stream_seek(data->parent, data->offset + data->pos, SEEK_SET) < 0) {
+    if (arc_stream_tell(data->parent) != data->offset + data->pos &&
+        arc_stream_seek(data->parent, data->offset + data->pos, SEEK_SET) < 0) {
         return -1;
     }
     
@@ -239,6 +232,8 @@ static ssize_t substream_read(ArcStream *stream, void *buf, size_t n) {
 static int substream_seek(ArcStream *stream, int64_t off, int whence) {
     struct SubstreamData *data = (struct SubstreamData *)stream->user_data;
     int64_t new_pos;
+    if ((whence == SEEK_CUR && off > 0 && data->pos > INT64_MAX - off) ||
+        (whence == SEEK_END && off > 0 && data->length > INT64_MAX - off)) { errno = EOVERFLOW; return -1; }
     
     switch (whence) {
         case SEEK_SET:
@@ -261,6 +256,7 @@ static int substream_seek(ArcStream *stream, int64_t off, int whence) {
     }
     
     data->pos = new_pos;
+    stream->bytes_read = 0;
     return 0;
 }
 
@@ -278,10 +274,12 @@ static void substream_close(ArcStream *stream) {
 
 // Public API
 ssize_t arc_stream_read(ArcStream *stream, void *buf, size_t n) {
-    if (!stream || !stream->vtable || !stream->vtable->read) {
+    if (!stream || (!buf && n) || !stream->vtable || !stream->vtable->read) {
         errno = EINVAL;
         return -1;
     }
+    if (!n) return 0;
+    if (n > (size_t)SSIZE_MAX) n = (size_t)SSIZE_MAX;
     return stream->vtable->read(stream, buf, n);
 }
 
@@ -363,7 +361,7 @@ ArcStream *arc_stream_from_memory(const void *data, size_t size, int64_t byte_li
 }
 
 ArcStream *arc_stream_substream(ArcStream *parent, int64_t offset, int64_t length) {
-    if (!parent || offset < 0 || length < 0) {
+    if (!parent || offset < 0 || length < 0 || length > INT64_MAX - offset) {
         return NULL;
     }
     
@@ -391,3 +389,43 @@ ArcStream *arc_stream_substream(ArcStream *parent, int64_t offset, int64_t lengt
     return stream;
 }
 
+
+static ssize_t view_read(ArcStream *s, void *buf, size_t n) { return arc_stream_read(s->user_data, buf, n); }
+static int view_seek(ArcStream *s, int64_t off, int whence) { return arc_stream_seek(s->user_data, off, whence); }
+static int64_t view_tell(ArcStream *s) { return arc_stream_tell(s->user_data); }
+static void view_close(ArcStream *s) { free(s); }
+ArcStream *arc_stream_view(ArcStream *parent) {
+    static const struct ArcStreamVtable table = {view_read, view_seek, view_tell, view_close};
+    if (!parent) { errno = EINVAL; return NULL; }
+    ArcStream *view = calloc(1, sizeof(*view));
+    if (view) { view->vtable = &table; view->user_data = parent; }
+    return view;
+}
+
+struct OwnedStream { ArcStream *stream; ArcStream *parent; };
+static ssize_t owned_read(ArcStream *s, void *buf, size_t n) {
+    struct OwnedStream *owned = s->user_data;
+    return arc_stream_read(owned->stream, buf, n);
+}
+static int owned_seek(ArcStream *s, int64_t off, int whence) {
+    struct OwnedStream *owned = s->user_data;
+    return arc_stream_seek(owned->stream, off, whence);
+}
+static int64_t owned_tell(ArcStream *s) {
+    struct OwnedStream *owned = s->user_data;
+    return arc_stream_tell(owned->stream);
+}
+static void owned_close(ArcStream *s) {
+    struct OwnedStream *owned = s->user_data;
+    arc_stream_close(owned->stream); arc_stream_close(owned->parent);
+    free(owned); free(s);
+}
+ArcStream *arc_stream_with_parent(ArcStream *stream, ArcStream *parent) {
+    static const struct ArcStreamVtable table = {owned_read, owned_seek, owned_tell, owned_close};
+    struct OwnedStream *owned = malloc(sizeof(*owned));
+    ArcStream *wrapper = calloc(1, sizeof(*wrapper));
+    if (!owned || !wrapper) { free(owned); free(wrapper); return NULL; }
+    owned->stream = stream; owned->parent = parent;
+    wrapper->vtable = &table; wrapper->user_data = owned;
+    return wrapper;
+}

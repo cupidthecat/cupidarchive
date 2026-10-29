@@ -49,7 +49,7 @@ static ssize_t xz_read(ArcStream *stream, void *buf, size_t n) {
     if (stream->byte_limit > 0) {
         int64_t remaining = stream->byte_limit - stream->bytes_read;
         if (remaining <= 0) {
-            return 0;
+            errno = EOVERFLOW; return -1;
         }
         if ((int64_t)n > remaining) {
             n = (size_t)remaining;
@@ -126,9 +126,7 @@ static int xz_seek(ArcStream *stream, int64_t off, int whence) {
 }
 
 static int64_t xz_tell(ArcStream *stream) {
-    (void)stream;
-    errno = ESPIPE;
-    return -1;
+    return stream->bytes_read;
 }
 
 static void xz_close(ArcStream *stream) {

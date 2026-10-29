@@ -716,15 +716,8 @@ int arc_tar_next(ArcReader *reader, ArcEntry *entry) {
     }
     TarReader *tar = (TarReader *)reader;
     
-    // If we have a valid entry with data remaining, skip it before reading next.
-    if (tar->entry_valid && tar->entry_data_remaining > 0) {
-        uint64_t prev = (uint64_t)tar->entry_data_remaining;
-        if (tar_skip_bytes(tar->base.stream, prev) < 0) return -1;
-        if (tar_skip_padding(tar->base.stream, prev) < 0) return -1;
-        tar->entry_data_remaining = 0;
-        tar->entry_valid = false;
-    }
-    
+    if (tar->entry_valid && arc_tar_skip_data(reader) < 0) return -1;
+
     int ret = tar_read_entry(tar);
     if (ret == 0) {
         *entry = tar->current_entry;
@@ -743,7 +736,7 @@ ArcStream *arc_tar_open_data(ArcReader *reader) {
         return NULL;
     }
     TarReader *tar = (TarReader *)reader;
-    if (!tar->entry_valid || tar->entry_data_remaining == 0) {
+    if (!tar->entry_valid) {
         return NULL;
     }
     
@@ -762,10 +755,14 @@ int arc_tar_skip_data(ArcReader *reader) {
         return -1;
     }
     
-    uint64_t prev = (uint64_t)tar->entry_data_remaining;
-    if (tar_skip_bytes(tar->base.stream, prev) < 0) return -1;
-    if (tar_skip_padding(tar->base.stream, prev) < 0) return -1;
-    
+    int64_t current = arc_stream_tell(tar->base.stream);
+    uint64_t size = (uint64_t)tar->entry_data_remaining;
+    uint64_t padding = (512 - size % 512) % 512;
+    if (tar->entry_data_offset < 0 || size > INT64_MAX - padding ||
+        tar->entry_data_offset > INT64_MAX - (int64_t)(size + padding)) { errno = EOVERFLOW; return -1; }
+    int64_t target = tar->entry_data_offset + (int64_t)(size + padding);
+    if (current < 0 || current > target) { errno = EINVAL; return -1; }
+    if (tar_skip_bytes(tar->base.stream, (uint64_t)(target - current)) < 0) return -1;
     tar->entry_data_remaining = 0;
     tar->entry_valid = false; // Mark as invalid after skipping
     return 0;
